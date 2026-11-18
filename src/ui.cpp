@@ -32,8 +32,6 @@ std::vector<std::string> g_sceneLabels, g_modelLabels, g_pickLabels;
 
 constexpr uint64_t kShapeKey = 1000;
 constexpr uint64_t kTexKey = 2000;
-constexpr uint64_t kUdimKey = kTexKey - 1;
-constexpr int32_t kUdimTexture = -2;
 
 // ---------------------------------------------------------------------------------------------
 // small helpers
@@ -175,7 +173,7 @@ void refresh_model_list() {
     std::vector<uint64_t> keys;
     g_modelLabels.clear();
     if (mesh) {
-        g_modelLabels.reserve(3 + mesh->subs.size() + mesh->textures->size());
+        g_modelLabels.reserve(2 + mesh->subs.size() + mesh->textures->size());
         char buf[160];
         std::snprintf(buf, sizeof(buf), "%s  -  %u tris  (press: show all shapes)", mesh->title.c_str(), mesh->triCount);
         g_modelLabels.push_back(buf);
@@ -186,8 +184,6 @@ void refresh_model_list() {
             g_modelLabels.push_back(buf);
             keys.push_back(kShapeKey + s.shapeIndex);
         }
-        g_modelLabels.push_back("   UDIM  all textures");
-        keys.push_back(kUdimKey);
         for (size_t i = 0; i < mesh->textures->size(); ++i) {
             std::snprintf(buf, sizeof(buf), "   Texture %zu  %s", i, (*mesh->textures)[i].desc.c_str());
             g_modelLabels.push_back(buf);
@@ -211,7 +207,7 @@ void refresh_model_list() {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
                 "%s<br/>joints %u, shapes %u, materials %u<br/>%u vertices, %u triangles<br/>%zu textures<br/><br/>"
-                "Press a shape to show it alone. Choose UDIM to view all textures together, or a texture to view it in the 2D layout.",
+                "Press a shape to show it alone or a texture to view it in the 2D layout.",
                 mesh->title.c_str(), mesh->joints, mesh->shapes, mesh->materials, mesh->vertexCount, mesh->triCount,
                 mesh->textures->size());
             rml = buf;
@@ -224,12 +220,6 @@ void on_model_row(ModContext*, UiListHandle, uint64_t key, void*) {
     ViewState& v = view();
     if (key == 0) {
         v.solo = -1;
-    } else if (key == kUdimKey) {
-        v.uvTex = kUdimTexture;
-        set_preview_layout(PreviewLayout::TwoD);
-        v.textureMenuOpen = false;
-        set_flying_camera(false);
-        set_live_update(false);
     } else if (key >= kTexKey) {
         v.uvTex = static_cast<int>(key - kTexKey);
         set_preview_layout(PreviewLayout::TwoD);
@@ -257,7 +247,6 @@ void on_model_row(ModContext*, UiListHandle, uint64_t key, void*) {
 bool model_row_selected(ModContext*, UiListHandle, uint64_t key, void*) {
     const ViewState& v = view();
     if (key == 0) return v.solo < 0;
-    if (key == kUdimKey) return v.uvTex == kUdimTexture;
     if (key >= kTexKey) return v.uvTex == static_cast<int>(key - kTexKey);
     return v.solo == static_cast<int>(key - kShapeKey);
 }
@@ -382,9 +371,9 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
 
     svc_ui->pane_add_rml(mod_ctx, right,
         "Use the preview toolbar to choose 2D, 3D, or Both. Both splits the preview into equal 3D and UV panes. "
-        "Choose UDIM in the UV texture picker to arrange all model textures on their UV tiles. "
         "3D display modes are Solid, Textured, Solid + Wire, Textured + Wire, and Wire. "
         "Flying camera and live-pose controls are shown only in 3D; the UV pane has its own pan, zoom, and texture picker. "
+        "The U-/U+/V-/V+ preview buttons shift the UV unwrap by one tile relative to the selected texture. "
         "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance. "
         "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "
         "In flying mode, WASD moves, Q/E moves vertically, Shift speeds up, and mouse-drag looks around. "

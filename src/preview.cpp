@@ -9,8 +9,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <limits>
-#include <set>
 #include <vector>
 
 #include "common.hpp"
@@ -162,8 +160,6 @@ struct OverlayOut {
 
 constexpr uint32_t kUniformSize = 128;
 constexpr uint32_t kVertexStride = 24;
-constexpr int32_t kUdimTexture = -2;
-
 struct Uniforms {
     float viewProj[16];
     float p0[4];
@@ -187,6 +183,8 @@ struct PresentPayload {
     float flyPosition[3];
     float uvPanX;
     float uvPanY;
+    int32_t uvTileOffsetX;
+    int32_t uvTileOffsetY;
     float uvZoom;
     int32_t texturePage;
     uint32_t flyingCamera;
@@ -200,12 +198,6 @@ struct OverlayVertex {
     float color[4];
 };
 static_assert(sizeof(OverlayVertex) == 24);
-
-struct UdimTile {
-    uint32_t texture;
-    int32_t x;
-    int32_t y;
-};
 
 // ---------------------------------------------------------------------------------------------
 // Window state (game thread)
@@ -247,14 +239,11 @@ struct Gpu {
 
     uint64_t meshVersion = 0;
     std::shared_ptr<const MeshData> mesh;
-    WGPUBuffer vbuf = nullptr, udimVbuf = nullptr, uvBgVbuf = nullptr, ibuf = nullptr;
+    WGPUBuffer vbuf = nullptr, uvBgVbuf = nullptr, ibuf = nullptr;
     uint64_t vbufSize = 0, ibufSize = 0;
-    uint64_t udimVbufSize = 0, uvBgVbufSize = 0;
+    uint64_t uvBgVbufSize = 0;
     std::vector<WGPUTexture> texs;
     std::vector<WGPUTextureView> views;
-    std::vector<std::pair<int32_t, int32_t>> udimOffsets;
-    std::vector<UdimTile> udimTiles;
-    int32_t udimMinX = 0, udimMaxX = 0, udimMinY = 0, udimMaxY = 0;
 };
 Gpu g;
 
@@ -268,16 +257,13 @@ void rel(WGPUShaderModule& m) { if (m) { wgpuShaderModuleRelease(m); m = nullptr
 
 void release_mesh_gpu() {
     rel(g.vbuf);
-    rel(g.udimVbuf);
     rel(g.uvBgVbuf);
     rel(g.ibuf);
     for (auto& v : g.views) rel(v);
     for (auto& t : g.texs) rel(t);
     g.views.clear();
     g.texs.clear();
-    g.udimOffsets.clear();
-    g.udimTiles.clear();
-    g.vbufSize = g.udimVbufSize = g.uvBgVbufSize = g.ibufSize = 0;
+    g.vbufSize = g.uvBgVbufSize = g.ibufSize = 0;
     g.mesh.reset();
     g.meshVersion = 0;
 }
@@ -516,134 +502,6 @@ void ensure_depth(uint32_t w, uint32_t h) {
     g.depthH = h;
 }
 
-void build_udim_layout(const MeshData& mesh) {
-    const size_t textureCount = mesh.textures->size();
-    g.udimOffsets.assign(textureCount, {0, 0});
-    g.udimTiles.clear();
-    if (textureCount == 0) return;
-
-    std::vector<std::set<std::pair<int32_t, int32_t>>> nativeTiles(textureCount);
-    for (const SubMesh& sub : mesh.subs) {
-        if (sub.texture < 0 || static_cast<size_t>(sub.texture) >= textureCount ||
-            sub.vertexCount == 0) continue;
-        float minU = std::numeric_limits<float>::infinity();
-        float maxU = -minU;
-        float minV = minU;
-        float maxV = -minU;
-        const uint64_t end = std::min<uint64_t>(
-            static_cast<uint64_t>(sub.firstVertex) + sub.vertexCount, mesh.vertexCount);
-        for (uint64_t vertex = sub.firstVertex; vertex < end; ++vertex) {
-            const size_t offset = static_cast<size_t>(vertex) * 6;
-            const float u = mesh.vertices[offset + 3];
-            const float v = mesh.vertices[offset + 4];
-            if (!std::isfinite(u) || !std::isfinite(v)) continue;
-            minU = std::min(minU, u);
-            maxU = std::max(maxU, u);
-            minV = std::min(minV, v);
-            maxV = std::max(maxV, v);
-        }
-        if (!std::isfinite(minU)) continue;
-        const int32_t tileX = static_cast<int32_t>(std::clamp(
-            std::floor((minU + maxU) * 0.5f), -4096.0f, 4096.0f));
-        const int32_t tileY = static_cast<int32_t>(std::clamp(
-            std::floor((minV + maxV) * 0.5f), -4096.0f, 4096.0f));
-        nativeTiles[static_cast<size_t>(sub.texture)].insert({tileX, tileY});
-    }
-
-    std::set<std::pair<int32_t, int32_t>> occupied;
-    const int32_t columns = std::max<int32_t>(
-        1, static_cast<int32_t>(std::ceil(std::sqrt(static_cast<double>(textureCount)))));
-    for (size_t texture = 0; texture < textureCount; ++texture) {
-        auto& tiles = nativeTiles[texture];
-        if (tiles.empty()) {
-            int32_t candidate = 0;
-            while (occupied.count({candidate % columns, candidate / columns}) != 0) ++candidate;
-            const std::pair<int32_t, int32_t> placement{candidate % columns, candidate / columns};
-            g.udimOffsets[texture] = placement;
-            occupied.insert(placement);
-            g.udimTiles.push_back({static_cast<uint32_t>(texture), placement.first, placement.second});
-            continue;
-        }
-
-        bool collision = false;
-        for (const auto& tile : tiles) {
-            if (occupied.count(tile) != 0) {
-                collision = true;
-                break;
-            }
-        }
-        int32_t offsetX = 0;
-        int32_t offsetY = 0;
-        if (collision) {
-            const auto first = *tiles.begin();
-            bool placed = false;
-            const int32_t searchLimit = static_cast<int32_t>(textureCount * 32 + 1024);
-            for (int32_t candidate = 0; candidate < searchLimit && !placed; ++candidate) {
-                const int32_t x = candidate % columns;
-                const int32_t y = candidate / columns;
-                const int32_t dx = x - first.first;
-                const int32_t dy = y - first.second;
-                bool free = true;
-                for (const auto& tile : tiles) {
-                    if (occupied.count({tile.first + dx, tile.second + dy}) != 0) {
-                        free = false;
-                        break;
-                    }
-                }
-                if (free) {
-                    offsetX = dx;
-                    offsetY = dy;
-                    placed = true;
-                }
-            }
-            if (!placed) {
-                logf(2, "UDIM placement failed for texture %zu; preserving source UVs", texture);
-            }
-        }
-        g.udimOffsets[texture] = {offsetX, offsetY};
-        for (const auto& tile : tiles) {
-            const int32_t x = tile.first + offsetX;
-            const int32_t y = tile.second + offsetY;
-            occupied.insert({x, y});
-            g.udimTiles.push_back({static_cast<uint32_t>(texture), x, y});
-        }
-    }
-
-    if (g.udimTiles.empty()) return;
-    g.udimMinX = g.udimMaxX = g.udimTiles.front().x;
-    g.udimMinY = g.udimMaxY = g.udimTiles.front().y;
-    for (const UdimTile& tile : g.udimTiles) {
-        g.udimMinX = std::min(g.udimMinX, tile.x);
-        g.udimMaxX = std::max(g.udimMaxX, tile.x);
-        g.udimMinY = std::min(g.udimMinY, tile.y);
-        g.udimMaxY = std::max(g.udimMaxY, tile.y);
-    }
-
-    std::vector<float> vertices = mesh.vertices;
-    for (const SubMesh& sub : mesh.subs) {
-        if (sub.texture < 0 || static_cast<size_t>(sub.texture) >= g.udimOffsets.size()) continue;
-        const auto offset = g.udimOffsets[static_cast<size_t>(sub.texture)];
-        const uint64_t end = std::min<uint64_t>(
-            static_cast<uint64_t>(sub.firstVertex) + sub.vertexCount, mesh.vertexCount);
-        for (uint64_t vertex = sub.firstVertex; vertex < end; ++vertex) {
-            const size_t uvOffset = static_cast<size_t>(vertex) * 6 + 3;
-            vertices[uvOffset] += static_cast<float>(offset.first);
-            vertices[uvOffset + 1] += static_cast<float>(offset.second);
-        }
-    }
-    const uint64_t bytes = static_cast<uint64_t>(vertices.size()) * sizeof(float);
-    if (bytes == 0) return;
-    WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
-    bd.label = {"inspector UDIM vertices", WGPU_STRLEN};
-    bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-    bd.size = bytes;
-    g.udimVbuf = wgpuDeviceCreateBuffer(g.device, &bd);
-    g.udimVbufSize = bytes;
-    if (g.udimVbuf != nullptr) {
-        wgpuQueueWriteBuffer(g.queue, g.udimVbuf, 0, vertices.data(), bytes);
-    }
-}
-
 void sync_mesh() {
     if (mesh_version() == g.meshVersion) return;
     std::shared_ptr<const MeshData> mesh = current_mesh();
@@ -713,7 +571,6 @@ void sync_mesh() {
         if (t.w == 0 || t.h == 0 || t.rgba.empty()) continue;
         create_rgba(t.w, t.h, t.rgba.data(), g.texs[i], g.views[i]);
     }
-    build_udim_layout(*mesh);
 }
 
 WGPUBindGroup make_bg(WGPUBindGroupLayout layout, WGPUTextureView view, WGPUSampler samp,
@@ -793,6 +650,10 @@ constexpr int32_t kTextureControl = 8;
 constexpr int32_t kTexturePrevControl = 9;
 constexpr int32_t kTextureNextControl = 10;
 constexpr int32_t kLiveControl = 11;
+constexpr int32_t kUvTileUMinusControl = 12;
+constexpr int32_t kUvTileUPlusControl = 13;
+constexpr int32_t kUvTileVMinusControl = 14;
+constexpr int32_t kUvTileVPlusControl = 15;
 constexpr int32_t kTextureRowFirstControl = 100;
 constexpr int32_t kTextureRowsPerPage = 8;
 
@@ -835,8 +696,18 @@ std::vector<ToolbarButton> toolbar_buttons(float width, PreviewLayout layout, ui
         const float regionLeft = layout == PreviewLayout::Both ? width * 0.5f : 0.0f;
         const float regionWidth = layout == PreviewLayout::Both ? width * 0.5f : width;
         const float scale = std::clamp(regionWidth / 660.0f, 0.4f, 1.0f);
-        buttons.push_back({regionLeft + 7.0f * scale, controlsY,
-            kToolbarTextureWidth * scale, controlsH, kTextureControl});
+        float uvX = regionLeft + 7.0f * scale;
+        buttons.push_back({uvX, controlsY, kToolbarTextureWidth * scale,
+            controlsH, kTextureControl});
+        uvX += (kToolbarTextureWidth + kToolbarGap) * scale;
+        constexpr float tileButtonWidth = 32.0f;
+        const int32_t tileControls[] = {
+            kUvTileUMinusControl, kUvTileUPlusControl,
+            kUvTileVMinusControl, kUvTileVPlusControl};
+        for (int32_t control : tileControls) {
+            buttons.push_back({uvX, controlsY, tileButtonWidth * scale, controlsH, control});
+            uvX += (tileButtonWidth + kToolbarGap) * scale;
+        }
     }
     return buttons;
 }
@@ -860,7 +731,7 @@ struct TextureMenuLayout {
 TextureMenuLayout texture_menu_layout(float width, float height, size_t textureCount, int page,
     PreviewLayout previewLayout) {
     TextureMenuLayout layout{};
-    const size_t itemCount = textureCount + 1;
+    const size_t itemCount = textureCount;
     layout.pageCount = std::max(1, static_cast<int>(
         (itemCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
     const int clampedPage = std::clamp(page, 0, layout.pageCount - 1);
@@ -1029,7 +900,8 @@ void append_triangle(std::vector<OverlayVertex>& vertices, float x0, float y0, f
 
 void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t targetHeight,
     PreviewLayout layout, uint32_t mode, uint32_t upAxis, int32_t hoverControl, uint32_t flyingCamera,
-    int32_t uvTex, uint32_t textureMenuOpen, int32_t texturePage, uint32_t liveUpdate) {
+    int32_t uvTex, int32_t uvTileOffsetX, int32_t uvTileOffsetY,
+    uint32_t textureMenuOpen, int32_t texturePage, uint32_t liveUpdate) {
     if (g.pOverlay == nullptr || targetWidth == 0 || targetHeight == 0) return;
     static thread_local std::vector<OverlayVertex> vertices;
     vertices.clear();
@@ -1044,8 +916,7 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
     const float hoverBg[4] = {0.23f, 0.27f, 0.33f, 1.0f};
     const float textColor[4] = {0.95f, 0.96f, 0.98f, 1.0f};
     char textureLabel[24] = {};
-    if (uvTex == kUdimTexture) std::snprintf(textureLabel, sizeof(textureLabel), "UDIM");
-    else if (uvTex >= 0) std::snprintf(textureLabel, sizeof(textureLabel), "TEX %02d", uvTex);
+    if (uvTex >= 0) std::snprintf(textureLabel, sizeof(textureLabel), "TEX %02d", uvTex);
     else std::snprintf(textureLabel, sizeof(textureLabel), "TEX --");
     append_rect(vertices, 0, 0, width, toolbar_height(width, layout, mode), width, height, toolbarBg);
     if (layout == PreviewLayout::Both) {
@@ -1093,13 +964,30 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             button.id == kLayout3DControl ? "3D" :
             button.id == kLayoutBothControl ? "BOTH" :
             button.id == kFlyControl ? "FLY" :
-            button.id == kAxisControl ? axis_label(upAxis) : textureLabel;
+            button.id == kAxisControl ? axis_label(upAxis) :
+            button.id == kUvTileUMinusControl ? "U-" :
+            button.id == kUvTileUPlusControl ? "U+" :
+            button.id == kUvTileVMinusControl ? "V-" :
+            button.id == kUvTileVPlusControl ? "V+" : textureLabel;
         const float fontScale = std::min(2.0f, button.h / 14.0f);
         const float textWidth = (static_cast<float>(std::strlen(label)) * 6.0f - 1.0f) * fontScale;
         const float textHeight = 7.0f * fontScale;
         const float textX = button.x + (button.w - textWidth) * 0.5f;
         const float textY = button.y + (button.h - textHeight) * 0.5f;
         append_text(vertices, label, textX, textY, fontScale, width, height, textColor);
+    }
+
+    if (layout != PreviewLayout::ThreeD) {
+        float statusX = layout == PreviewLayout::Both ? width * 0.5f + 8.0f : 8.0f;
+        for (const ToolbarButton& button : buttons) {
+            if (button.id >= kUvTileUMinusControl && button.id <= kUvTileVPlusControl) {
+                statusX = std::max(statusX, button.x + button.w + 6.0f);
+            }
+        }
+        char tileLabel[48];
+        std::snprintf(tileLabel, sizeof(tileLabel), "UV U%d V%d", uvTileOffsetX, uvTileOffsetY);
+        const float scale = 1.0f;
+        append_text(vertices, tileLabel, statusX, 41.0f, scale, width, height, textColor);
     }
 
     if (layout != PreviewLayout::ThreeD && textureMenuOpen != 0 &&
@@ -1115,20 +1003,14 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             const size_t index = menuLayout.first + row;
             const float y = menuLayout.y + 2.0f + static_cast<float>(row) * menuLayout.rowHeight;
             const int32_t control = kTextureRowFirstControl + static_cast<int32_t>(row);
-            const bool udimItem = index == 0;
             char label[64];
-            if (udimItem) {
-                std::snprintf(label, sizeof(label), "UDIM ALL");
+            const TexImage& texture = (*g.mesh->textures)[index];
+            if (!texture.desc.empty()) {
+                std::snprintf(label, sizeof(label), "%02zu %s", index, texture.desc.c_str());
             } else {
-                const TexImage& texture = (*g.mesh->textures)[index - 1];
-                if (!texture.desc.empty()) {
-                    std::snprintf(label, sizeof(label), "%02zu %s", index - 1, texture.desc.c_str());
-                } else {
-                    std::snprintf(label, sizeof(label), "%02zu %ux%u", index - 1, texture.w, texture.h);
-                }
+                std::snprintf(label, sizeof(label), "%02zu %ux%u", index, texture.w, texture.h);
             }
-            const bool selected = udimItem ? uvTex == kUdimTexture :
-                uvTex == static_cast<int32_t>(index - 1);
+            const bool selected = uvTex == static_cast<int32_t>(index);
             const float* fill = control == hoverControl ? hoverBg : selected ? selectedBg : rowBg;
             append_rect(vertices, menuLayout.x + 2.0f, y, menuLayout.x + menuLayout.width - 2.0f,
                 y + menuLayout.rowHeight - 1.0f, width, height, fill);
@@ -1350,24 +1232,16 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
 
     if (haveMesh && showUV) {
         wgpuRenderPassEncoderSetViewport(pass, uvX, toolbar, uvWidth, contentHeight, 0.0f, 1.0f);
-        const bool udim = pl.uvTex == kUdimTexture && !g.udimTiles.empty() && g.udimVbuf != nullptr;
-        const int32_t minX = udim ? g.udimMinX : 0;
-        const int32_t maxX = udim ? g.udimMaxX : 0;
-        const int32_t minY = udim ? g.udimMinY : 0;
-        const int32_t maxY = udim ? g.udimMaxY : 0;
-        const float mapWidth = static_cast<float>(maxX - minX + 1);
-        const float mapHeight = static_cast<float>(maxY - minY + 1);
-        const float tileScale = std::min(uvWidth / mapWidth, contentHeight / mapHeight) *
+        const float tileScale = std::min(uvWidth, contentHeight) *
             0.9f * std::max(pl.uvZoom, 0.05f);
         const float sx = 2.0f * tileScale / uvWidth;
         const float sy = 2.0f * tileScale / contentHeight;
-        const float centerU = udim ? (static_cast<float>(minX) + maxX + 1.0f) * 0.5f : 0.5f;
-        const float centerV = udim ? (static_cast<float>(minY) + maxY + 1.0f) * 0.5f : 0.5f;
+        const float centerU = 0.5f;
+        const float centerV = 0.5f;
 
         static thread_local std::vector<float> quadVertices;
         quadVertices.clear();
-        const size_t tileCount = udim ? g.udimTiles.size() : 1;
-        quadVertices.reserve(tileCount * 36);
+        quadVertices.reserve(36);
         const auto appendQuad = [&](int32_t tileX, int32_t tileY) {
             const float x0 = (static_cast<float>(tileX) - centerU) * sx + pl.uvPanX;
             const float x1 = x0 + sx;
@@ -1379,11 +1253,7 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
                 {x1, y0, 0.0f, 1.0f, 0.0f, 0.0f}, {x1, y1, 0.0f, 1.0f, 1.0f, 0.0f}};
             for (const auto& vertex : data) quadVertices.insert(quadVertices.end(), vertex, vertex + 6);
         };
-        if (udim) {
-            for (const UdimTile& tile : g.udimTiles) appendQuad(tile.x, tile.y);
-        } else {
-            appendQuad(0, 0);
-        }
+        appendQuad(0, 0);
         const uint64_t quadBytes = static_cast<uint64_t>(quadVertices.size()) * sizeof(float);
         if (g.uvBgVbuf == nullptr || g.uvBgVbufSize < quadBytes) {
             rel(g.uvBgVbuf);
@@ -1406,38 +1276,27 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
             Uniforms wireUniforms{};
             wireUniforms.uvxf[0] = sx;
             wireUniforms.uvxf[1] = -sy;
-            wireUniforms.uvxf[2] = -centerU * sx + pl.uvPanX;
-            wireUniforms.uvxf[3] = centerV * sy + pl.uvPanY;
+            wireUniforms.uvxf[2] = -centerU * sx +
+                static_cast<float>(pl.uvTileOffsetX) * sx + pl.uvPanX;
+            wireUniforms.uvxf[3] = centerV * sy -
+                static_cast<float>(pl.uvTileOffsetY) * sy + pl.uvPanY;
             wgpuQueueWriteBuffer(g.queue, g.uvWireUbuf, 0, &wireUniforms,
                 sizeof(wireUniforms));
             const WGPUSampler sampler = (pl.flags & 1u) ? g.sampNearest : g.sampLinear;
             wgpuRenderPassEncoderSetPipeline(pass, g.pUvBg);
             wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g.uvBgVbuf, 0, quadBytes);
-            if (udim) {
-                for (size_t i = 0; i < g.udimTiles.size(); ++i) {
-                    const UdimTile& tile = g.udimTiles[i];
-                    WGPUBindGroup bg = make_bg(g.lUvBg, view_for(static_cast<int32_t>(tile.texture),
-                        g.viewDark), sampler, g.uvUbuf);
-                    if (bg == nullptr) continue;
-                    wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
-                    wgpuRenderPassEncoderDraw(pass, 6, 1, static_cast<uint32_t>(i * 6), 0);
-                    wgpuBindGroupRelease(bg);
-                }
-            } else {
-                const int32_t uvTexture = pl.uvTex >= 0
-                    ? pl.uvTex : default_uv_texture(*g.mesh, pl.solo);
-                WGPUBindGroup bg = make_bg(g.lUvBg, view_for(uvTexture, g.viewDark), sampler, g.uvUbuf);
-                if (bg != nullptr) {
-                    wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
-                    wgpuRenderPassEncoderDraw(pass, 6, 1, 0, 0);
-                    wgpuBindGroupRelease(bg);
-                }
+            const int32_t uvTexture = pl.uvTex >= 0
+                ? pl.uvTex : default_uv_texture(*g.mesh, pl.solo);
+            WGPUBindGroup bg = make_bg(g.lUvBg, view_for(uvTexture, g.viewDark), sampler, g.uvUbuf);
+            if (bg != nullptr) {
+                wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
+                wgpuRenderPassEncoderDraw(pass, 6, 1, 0, 0);
+                wgpuBindGroupRelease(bg);
             }
             WGPUBindGroup bgw = make_bg(g.lUvWire, nullptr, nullptr, g.uvWireUbuf);
             if (bgw != nullptr) {
                 wgpuRenderPassEncoderSetPipeline(pass, g.pUvWire);
-                draw_wire(pass, bgw, pl.solo, udim ? g.udimVbuf : g.vbuf,
-                    udim ? g.udimVbufSize : g.vbufSize);
+                draw_wire(pass, bgw, pl.solo, g.vbuf, g.vbufSize);
                 wgpuBindGroupRelease(bgw);
             }
         }
@@ -1445,8 +1304,8 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
 
     if (ready) {
         draw_toolbar(pass, c->target_width, c->target_height, layout, pl.mode, pl.upAxis,
-            pl.hoverControl, pl.flyingCamera, pl.uvTex, pl.textureMenuOpen, pl.texturePage,
-            pl.liveUpdate);
+            pl.hoverControl, pl.flyingCamera, pl.uvTex, pl.uvTileOffsetX, pl.uvTileOffsetY,
+            pl.textureMenuOpen, pl.texturePage, pl.liveUpdate);
     }
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
@@ -1550,6 +1409,8 @@ void update_preview_input(ViewState& v) {
         v.uvZoomPct = 100;
         v.uvPanX = 0.0f;
         v.uvPanY = 0.0f;
+        v.uvTileOffsetX = 0;
+        v.uvTileOffsetY = 0;
         v.autoRotate = false;
         if (v.flyingCamera) v.flyPositionInitialized = false;
         g_dragMode = 0;
@@ -1565,9 +1426,8 @@ void update_preview_input(ViewState& v) {
 
     const std::shared_ptr<const MeshData> mesh = current_mesh();
     const size_t textureCount = mesh ? mesh->textures->size() : 0;
-    const size_t textureMenuItems = textureCount + (textureCount > 0 ? 1 : 0);
     const int pageCount = std::max(1, static_cast<int>(
-        (textureMenuItems + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
+        (textureCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
     v.texturePage = std::clamp(v.texturePage, 0, pageCount - 1);
     if (v.flyingCamera && !v.flyPositionInitialized) initialize_fly_position(v);
 
@@ -1632,6 +1492,14 @@ void update_preview_input(ViewState& v) {
             if (v.flyingCamera) initialize_fly_position(v);
         } else if (g_hoverControl == kAxisControl) {
             v.upAxis = (v.upAxis + 1) % 3;
+        } else if (g_hoverControl == kUvTileUMinusControl) {
+            v.uvTileOffsetX = std::max(v.uvTileOffsetX - 1, -9999);
+        } else if (g_hoverControl == kUvTileUPlusControl) {
+            v.uvTileOffsetX = std::min(v.uvTileOffsetX + 1, 9999);
+        } else if (g_hoverControl == kUvTileVMinusControl) {
+            v.uvTileOffsetY = std::max(v.uvTileOffsetY - 1, -9999);
+        } else if (g_hoverControl == kUvTileVPlusControl) {
+            v.uvTileOffsetY = std::min(v.uvTileOffsetY + 1, 9999);
         } else if (g_hoverControl == kTextureControl) {
             v.textureMenuOpen = !v.textureMenuOpen;
         } else if (g_hoverControl == kLiveControl) {
@@ -1641,12 +1509,10 @@ void update_preview_input(ViewState& v) {
         } else if (g_hoverControl == kTextureNextControl) {
             v.texturePage = std::min(v.texturePage + 1, pageCount - 1);
         } else if (g_hoverControl >= kTextureRowFirstControl) {
-            const size_t menuIndex = static_cast<size_t>(v.texturePage) * kTextureRowsPerPage +
+            const size_t textureIndex = static_cast<size_t>(v.texturePage) * kTextureRowsPerPage +
                 static_cast<size_t>(g_hoverControl - kTextureRowFirstControl);
-            if (menuIndex == 0) {
-                v.uvTex = kUdimTexture;
-            } else if (menuIndex - 1 < textureCount) {
-                v.uvTex = static_cast<int>(menuIndex - 1);
+            if (textureIndex < textureCount) {
+                v.uvTex = static_cast<int>(textureIndex);
             }
             v.textureMenuOpen = false;
         }
@@ -1852,6 +1718,8 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     pl.liveUpdate = v.liveUpdate ? 1u : 0u;
     pl.uvPanX = v.uvPanX;
     pl.uvPanY = v.uvPanY;
+    pl.uvTileOffsetX = v.uvTileOffsetX;
+    pl.uvTileOffsetY = v.uvTileOffsetY;
     pl.uvZoom = static_cast<float>(v.uvZoomPct) / 100.0f;
     if (svc_gfx->push_present(mod_ctx, g_target, &pl, sizeof(pl)) == MOD_ERROR) {
         g_recreateTarget = true;

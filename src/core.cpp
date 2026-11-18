@@ -84,6 +84,8 @@ void select_model(uint64_t key) {
     g_view.textureMenuOpen = false;
     g_view.uvPanX = 0.0f;
     g_view.uvPanY = 0.0f;
+    g_view.uvTileOffsetX = 0;
+    g_view.uvTileOffsetY = 0;
     g_view.uvZoomPct = 100;
 }
 

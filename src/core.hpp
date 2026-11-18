@@ -60,6 +60,8 @@ struct ViewState {
     float flyPosition[3] = {0.0f, 0.0f, 0.0f};
     float uvPanX = 0.0f;
     float uvPanY = 0.0f;
+    int uvTileOffsetX = 0;
+    int uvTileOffsetY = 0;
     int upAxis = 0;        // 0 = Y-up, 1 = Z-up, 2 = X-up
     int solo = -1;         // shape index shown alone, -1 = all
     int uvTex = -1;        // texture index shown behind the UV map, -1 = none
