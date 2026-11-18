@@ -80,6 +80,8 @@ void select_model(uint64_t key) {
     g_pendingSince = g_frame;
     g_view.solo = -1;
     g_view.uvTex = -1;
+    g_view.texturePage = 0;
+    g_view.textureMenuOpen = false;
 }
 
 uint64_t selected_key() {

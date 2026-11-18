@@ -43,12 +43,17 @@ struct ViewState {
     int mode = 1;  // 0 solid, 1 textured, 2 solid+wire, 3 textured+wire, 4 wire, 5 UV map
     bool autoRotate = true;
     bool nearest = false;
+    bool flyingCamera = false;
+    bool flyPositionInitialized = false;
     float yaw = 30.0f;     // degrees
     int pitch = 15;        // degrees
     int zoomPct = 100;
+    float flyPosition[3] = {0.0f, 0.0f, 0.0f};
     int upAxis = 0;        // 0 = Y-up, 1 = Z-up, 2 = X-up
     int solo = -1;         // shape index shown alone, -1 = all
     int uvTex = -1;        // texture index shown behind the UV map, -1 = none
+    int texturePage = 0;
+    bool textureMenuOpen = false;
 };
 
 // ---- frame / registry (game thread) ----

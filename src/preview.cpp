@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -74,20 +76,19 @@ struct MeshOut {
 }
 
 @fragment fn fs_mesh(i : MeshOut) -> @location(0) vec4<f32> {
+  let t = textureSample(tex, smp, i.uv);
+  if (u.p0.x > 0.5) {
+    if (t.a < 0.1) {
+      discard;
+    }
+    return vec4<f32>(t.rgb, 1.0);
+  }
   let dx = dpdx(i.world);
   let dy = dpdy(i.world);
   let n = normalize(cross(dx, dy));
   let l = normalize(vec3<f32>(0.35, 0.8, 0.5));
   let shade = 0.35 + 0.65 * abs(dot(n, l));
-  let t = textureSample(tex, smp, i.uv);
-  var base = hash_color(i.id);
-  if (u.p0.x > 0.5) {
-    base = t.rgb;
-  }
-  if (u.p0.x > 0.5 && t.a < 0.1) {
-    discard;
-  }
-  return vec4<f32>(base * shade, 1.0);
+  return vec4<f32>(hash_color(i.id) * shade, 1.0);
 }
 
 // ---- 3D wire overlay ----
@@ -183,6 +184,10 @@ struct PresentPayload {
     int32_t uvTex;
     uint32_t upAxis;
     int32_t hoverControl;
+    float flyPosition[3];
+    int32_t texturePage;
+    uint32_t flyingCamera;
+    uint32_t textureMenuOpen;
 };
 static_assert(sizeof(PresentPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 
@@ -204,6 +209,7 @@ int g_dragMode = 0; // 0 none, 1 orbit, 2 zoom
 int g_previousMouseX = 0;
 int g_previousMouseY = 0;
 int32_t g_hoverControl = -1;
+std::chrono::steady_clock::time_point g_lastInputTime{};
 
 // ---------------------------------------------------------------------------------------------
 // GPU state (render worker thread; released from the game thread at shutdown)
@@ -582,16 +588,25 @@ void draw_wire(WGPURenderPassEncoder pass, WGPUBindGroup bg, int32_t solo) {
 constexpr const char* kToolbarModes[] = {"SOLID", "TEX", "SOLID+WIRE", "TEX+WIRE", "WIRE", "UV"};
 constexpr float kToolbarModeWidths[] = {72.0f, 58.0f, 126.0f, 116.0f, 58.0f, 44.0f};
 constexpr float kToolbarAxisWidth = 74.0f;
+constexpr float kToolbarFlyWidth = 52.0f;
+constexpr float kToolbarTextureWidth = 88.0f;
 constexpr float kToolbarGap = 5.0f;
+constexpr int32_t kFlyControl = 6;
+constexpr int32_t kAxisControl = 7;
+constexpr int32_t kTextureControl = 8;
+constexpr int32_t kTexturePrevControl = 9;
+constexpr int32_t kTextureNextControl = 10;
+constexpr int32_t kTextureRowFirstControl = 100;
+constexpr int32_t kTextureRowsPerPage = 8;
 
 struct ToolbarButton {
     float x, y, w, h;
     int32_t id;
 };
 
-std::array<ToolbarButton, 7> toolbar_buttons(float width) {
-    const float scale = width < 620.0f ? std::max(width / 620.0f, 0.65f) : 1.0f;
-    std::array<ToolbarButton, 7> buttons{};
+std::array<ToolbarButton, 9> toolbar_buttons(float width) {
+    const float scale = width < 760.0f ? std::max(width / 760.0f, 0.4f) : 1.0f;
+    std::array<ToolbarButton, 9> buttons{};
     float x = 7.0f * scale;
     const float y = 4.0f * scale;
     const float h = 28.0f * scale;
@@ -600,13 +615,55 @@ std::array<ToolbarButton, 7> toolbar_buttons(float width) {
         buttons[i] = {x, y, buttonWidth, h, i};
         x += buttonWidth + kToolbarGap * scale;
     }
-    buttons[6] = {x, y, kToolbarAxisWidth * scale, h, 6};
+    buttons[kFlyControl] = {x, y, kToolbarFlyWidth * scale, h, kFlyControl};
+    x += kToolbarFlyWidth * scale + kToolbarGap * scale;
+    buttons[kAxisControl] = {x, y, kToolbarAxisWidth * scale, h, kAxisControl};
+    x += kToolbarAxisWidth * scale + kToolbarGap * scale;
+    buttons[kTextureControl] = {x, y, kToolbarTextureWidth * scale, h, kTextureControl};
     return buttons;
 }
 
 float toolbar_height(float width) {
     const auto buttons = toolbar_buttons(width);
     return buttons[0].y + buttons[0].h + 4.0f;
+}
+
+struct TextureMenuLayout {
+    float x = 0.0f;
+    float y = 0.0f;
+    float width = 164.0f;
+    float rowHeight = 20.0f;
+    float pagerY = 0.0f;
+    size_t first = 0;
+    size_t rowCount = 0;
+    int pageCount = 1;
+    bool hasPager = false;
+};
+
+TextureMenuLayout texture_menu_layout(float width, float height, size_t textureCount, int page) {
+    TextureMenuLayout layout{};
+    layout.pageCount = std::max(1, static_cast<int>(
+        (textureCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
+    const int clampedPage = std::clamp(page, 0, layout.pageCount - 1);
+    layout.first = static_cast<size_t>(clampedPage) * kTextureRowsPerPage;
+    layout.rowCount = textureCount > layout.first
+        ? std::min(static_cast<size_t>(kTextureRowsPerPage), textureCount - layout.first)
+        : 0;
+    layout.hasPager = layout.pageCount > 1;
+    const auto buttons = toolbar_buttons(width);
+    layout.x = buttons[kTextureControl].x;
+    if (layout.x + layout.width > width - 4.0f) {
+        layout.x = std::max(4.0f, width - layout.width - 4.0f);
+    }
+    layout.y = toolbar_height(width) + 2.0f;
+    layout.pagerY = layout.y + 4.0f + static_cast<float>(layout.rowCount) * layout.rowHeight;
+    const float menuHeight = 4.0f + static_cast<float>(layout.rowCount) * layout.rowHeight +
+        (layout.hasPager ? 24.0f : 0.0f);
+    if (layout.y + menuHeight > height - 2.0f) {
+        layout.y = std::max(0.0f, height - menuHeight - 2.0f);
+        layout.pagerY = layout.y + 4.0f + static_cast<float>(layout.rowCount) * layout.rowHeight;
+    }
+    return layout;
 }
 
 const char* axis_label(uint32_t axis) {
@@ -634,6 +691,24 @@ uint8_t glyph_row(char ch, int row) {
     static constexpr uint8_t p[7] = {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10};
     static constexpr uint8_t colon[7] = {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00};
     static constexpr uint8_t y[7] = {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04};
+    static constexpr uint8_t n[7] = {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11};
+    static constexpr uint8_t zero[7] = {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E};
+    static constexpr uint8_t one[7] = {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E};
+    static constexpr uint8_t two[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F};
+    static constexpr uint8_t three[7] = {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E};
+    static constexpr uint8_t four[7] = {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02};
+    static constexpr uint8_t five[7] = {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E};
+    static constexpr uint8_t six[7] = {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E};
+    static constexpr uint8_t seven[7] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08};
+    static constexpr uint8_t eight[7] = {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E};
+    static constexpr uint8_t nine[7] = {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E};
+    static constexpr uint8_t dash[7] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00};
+    static constexpr uint8_t a[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
+    static constexpr uint8_t b[7] = {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E};
+    static constexpr uint8_t c[7] = {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E};
+    static constexpr uint8_t f[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10};
+    static constexpr uint8_t g[7] = {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E};
+    static constexpr uint8_t m[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
     if (row < 0 || row >= 7) return 0;
     const uint8_t* rows = nullptr;
     switch (ch) {
@@ -653,6 +728,24 @@ uint8_t glyph_row(char ch, int row) {
     case 'P': rows = p; break;
     case ':': rows = colon; break;
     case 'Y': rows = y; break;
+    case 'N': rows = n; break;
+    case 'A': rows = a; break;
+    case 'B': rows = b; break;
+    case 'C': rows = c; break;
+    case 'F': rows = f; break;
+    case 'G': rows = g; break;
+    case 'M': rows = m; break;
+    case '0': rows = zero; break;
+    case '1': rows = one; break;
+    case '2': rows = two; break;
+    case '3': rows = three; break;
+    case '4': rows = four; break;
+    case '5': rows = five; break;
+    case '6': rows = six; break;
+    case '7': rows = seven; break;
+    case '8': rows = eight; break;
+    case '9': rows = nine; break;
+    case '-': rows = dash; break;
     default: return 0;
     }
     return rows[row];
@@ -692,7 +785,8 @@ void append_text(std::vector<OverlayVertex>& vertices, const char* text, float x
 }
 
 void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t targetHeight,
-    uint32_t mode, uint32_t upAxis, int32_t hoverControl) {
+    uint32_t mode, uint32_t upAxis, int32_t hoverControl, uint32_t flyingCamera,
+    int32_t uvTex, uint32_t textureMenuOpen, int32_t texturePage) {
     if (g.pOverlay == nullptr || targetWidth == 0 || targetHeight == 0) return;
     static thread_local std::vector<OverlayVertex> vertices;
     vertices.clear();
@@ -705,20 +799,68 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
     const float activeBg[4] = {0.10f, 0.32f, 0.53f, 1.0f};
     const float hoverBg[4] = {0.23f, 0.27f, 0.33f, 1.0f};
     const float textColor[4] = {0.95f, 0.96f, 0.98f, 1.0f};
+    char textureLabel[24] = {};
+    if (uvTex >= 0) std::snprintf(textureLabel, sizeof(textureLabel), "TEX %02d", uvTex);
+    else std::snprintf(textureLabel, sizeof(textureLabel), "TEX --");
     append_rect(vertices, 0, 0, width, toolbar_height(width), width, height, toolbarBg);
 
     for (const ToolbarButton& button : buttons) {
-        const bool active = button.id == 6 ? false : button.id == static_cast<int32_t>(mode);
+        const bool active = (button.id < 6 && button.id == static_cast<int32_t>(mode)) ||
+            (button.id == kFlyControl && flyingCamera != 0) ||
+            (button.id == kTextureControl && textureMenuOpen != 0);
         const float* fill = button.id == hoverControl ? hoverBg : active ? activeBg : buttonBg;
         append_rect(vertices, button.x, button.y, button.x + button.w, button.y + button.h,
             width, height, fill);
-        const char* label = button.id == 6 ? axis_label(upAxis) : kToolbarModes[button.id];
+        const char* label = button.id < 6 ? kToolbarModes[button.id] :
+            button.id == kFlyControl ? "FLY" :
+            button.id == kAxisControl ? axis_label(upAxis) : textureLabel;
         const float fontScale = std::min(2.0f, button.h / 14.0f);
         const float textWidth = (static_cast<float>(std::strlen(label)) * 6.0f - 1.0f) * fontScale;
         const float textHeight = 7.0f * fontScale;
         const float textX = button.x + (button.w - textWidth) * 0.5f;
         const float textY = button.y + (button.h - textHeight) * 0.5f;
         append_text(vertices, label, textX, textY, fontScale, width, height, textColor);
+    }
+
+    if (textureMenuOpen != 0 && g.mesh != nullptr && !g.mesh->textures.empty()) {
+        const TextureMenuLayout layout = texture_menu_layout(
+            width, height, g.mesh->textures.size(), texturePage);
+        const float menuBg[4] = {0.055f, 0.065f, 0.085f, 1.0f};
+        const float rowBg[4] = {0.12f, 0.14f, 0.18f, 1.0f};
+        const float selectedBg[4] = {0.10f, 0.32f, 0.53f, 1.0f};
+        append_rect(vertices, layout.x, layout.y, layout.x + layout.width,
+            layout.pagerY + (layout.hasPager ? 24.0f : 4.0f), width, height, menuBg);
+        for (size_t row = 0; row < layout.rowCount; ++row) {
+            const size_t index = layout.first + row;
+            const float y = layout.y + 2.0f + static_cast<float>(row) * layout.rowHeight;
+            const int32_t control = kTextureRowFirstControl + static_cast<int32_t>(row);
+            const float* fill = control == hoverControl ? hoverBg :
+                static_cast<int32_t>(index) == uvTex ? selectedBg : rowBg;
+            append_rect(vertices, layout.x + 2.0f, y, layout.x + layout.width - 2.0f,
+                y + layout.rowHeight - 1.0f, width, height, fill);
+            const TexImage& texture = g.mesh->textures[index];
+            char label[64];
+            if (!texture.desc.empty()) {
+                std::snprintf(label, sizeof(label), "%02zu %s", index, texture.desc.c_str());
+            } else {
+                std::snprintf(label, sizeof(label), "%02zu %ux%u", index, texture.w, texture.h);
+            }
+            append_text(vertices, label, layout.x + 8.0f, y + 6.0f, 1.0f,
+                width, height, textColor);
+        }
+        if (layout.hasPager) {
+            const float pagerWidth = (layout.width - 6.0f) * 0.5f;
+            const float* prevFill = hoverControl == kTexturePrevControl ? hoverBg : rowBg;
+            const float* nextFill = hoverControl == kTextureNextControl ? hoverBg : rowBg;
+            append_rect(vertices, layout.x + 2.0f, layout.pagerY,
+                layout.x + 2.0f + pagerWidth, layout.pagerY + 20.0f, width, height, prevFill);
+            append_rect(vertices, layout.x + 4.0f + pagerWidth, layout.pagerY,
+                layout.x + layout.width - 2.0f, layout.pagerY + 20.0f, width, height, nextFill);
+            append_text(vertices, "PREV", layout.x + 8.0f, layout.pagerY + 6.0f,
+                1.0f, width, height, textColor);
+            append_text(vertices, "NEXT", layout.x + 12.0f + pagerWidth, layout.pagerY + 6.0f,
+                1.0f, width, height, textColor);
+        }
     }
     if (vertices.empty()) return;
 
@@ -741,6 +883,73 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
     wgpuRenderPassEncoderSetPipeline(pass, g.pOverlay);
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g.overlayBuffer, 0, g.overlayBufferSize);
     wgpuRenderPassEncoderDraw(pass, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+}
+
+void axis_basis(uint32_t upAxis, float right[3], float up[3], float forward[3]) {
+    right[0] = 1.0f; right[1] = 0.0f; right[2] = 0.0f;
+    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+    forward[0] = 0.0f; forward[1] = 0.0f; forward[2] = 1.0f;
+    if (upAxis == 1) {
+        up[1] = 0.0f; up[2] = 1.0f;
+        forward[1] = -1.0f; forward[2] = 0.0f;
+    } else if (upAxis == 2) {
+        right[0] = 0.0f; right[1] = -1.0f;
+        up[0] = 1.0f; up[1] = 0.0f;
+    }
+}
+
+void mesh_sphere(const MeshData* mesh, float center[3], float& radius) {
+    if (mesh == nullptr) {
+        center[0] = center[1] = center[2] = 0.0f;
+        radius = 1.0f;
+        return;
+    }
+    float extent[3];
+    for (int i = 0; i < 3; ++i) {
+        center[i] = (mesh->bmin[i] + mesh->bmax[i]) * 0.5f;
+        extent[i] = mesh->bmax[i] - mesh->bmin[i];
+    }
+    radius = 0.5f * std::sqrt(extent[0] * extent[0] + extent[1] * extent[1] +
+        extent[2] * extent[2]);
+    if (!std::isfinite(radius) || radius <= 0.0f) radius = 1.0f;
+}
+
+void orbit_eye(const float center[3], float radius, float yawDegrees, float pitchDegrees,
+    float zoom, uint32_t upAxis, float eye[3]) {
+    float right[3], up[3], forward[3];
+    axis_basis(upAxis, right, up, forward);
+    const float yaw = yawDegrees * 3.14159265f / 180.0f;
+    const float pitch = pitchDegrees * 3.14159265f / 180.0f;
+    const float distance = radius / std::sin(20.0f * 3.14159265f / 180.0f) * 1.05f /
+        std::max(zoom, 0.05f);
+    const float horizontal = std::cos(pitch);
+    for (int i = 0; i < 3; ++i) {
+        eye[i] = center[i] + distance * (horizontal * std::sin(yaw) * right[i] +
+            std::sin(pitch) * up[i] + horizontal * std::cos(yaw) * forward[i]);
+    }
+}
+
+void camera_forward(float yawDegrees, float pitchDegrees, uint32_t upAxis, float direction[3]) {
+    float right[3], up[3], forward[3];
+    axis_basis(upAxis, right, up, forward);
+    const float yaw = yawDegrees * 3.14159265f / 180.0f;
+    const float pitch = pitchDegrees * 3.14159265f / 180.0f;
+    const float horizontal = std::cos(pitch);
+    for (int i = 0; i < 3; ++i) {
+        direction[i] = -(horizontal * std::sin(yaw) * right[i] +
+            std::sin(pitch) * up[i] + horizontal * std::cos(yaw) * forward[i]);
+    }
+}
+
+void initialize_fly_position(ViewState& v) {
+    float center[3];
+    float radius = 1.0f;
+    const std::shared_ptr<const MeshData> mesh = current_mesh();
+    mesh_sphere(mesh.get(), center, radius);
+    orbit_eye(center, radius, v.yaw, static_cast<float>(v.pitch),
+        static_cast<float>(v.zoomPct) / 100.0f, static_cast<uint32_t>(std::clamp(v.upAxis, 0, 2)),
+        v.flyPosition);
+    v.flyPositionInitialized = true;
 }
 
 void on_present(ModContext*, const GfxPresentContext* c, const void* payload, size_t size, void*) {
@@ -787,36 +996,33 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
 
         if (!uvMode) {
             const MeshData& m = *g.mesh;
-            const float ctr[3] = {(m.bmin[0] + m.bmax[0]) * 0.5f, (m.bmin[1] + m.bmax[1]) * 0.5f,
-                (m.bmin[2] + m.bmax[2]) * 0.5f};
-            const float ex = m.bmax[0] - m.bmin[0], ey = m.bmax[1] - m.bmin[1],
-                        ez = m.bmax[2] - m.bmin[2];
-                        float radius = std::max(0.5f * std::sqrt(ex * ex + ey * ey + ez * ez), 0.001f);
-                        if (!std::isfinite(radius) || radius <= 0.0f) radius = 1.0f; // Защита от NaN
+            float center[3];
+            float radius = 1.0f;
+            mesh_sphere(&m, center, radius);
             const float fov = 40.0f * 3.14159265f / 180.0f;
-            const float dist = radius / std::sin(fov * 0.5f) * 1.05f / std::max(pl.zoom, 0.05f);
-            const float yaw = pl.yaw * 3.14159265f / 180.0f;
-            const float pitch = pl.pitch * 3.14159265f / 180.0f;
-            float right[3] = {1, 0, 0};
-            float up[3] = {0, 1, 0};
-            float forward[3] = {0, 0, 1};
-            if (pl.upAxis == 1) {
-                up[0] = 0; up[1] = 0; up[2] = 1;
-                forward[0] = 0; forward[1] = -1; forward[2] = 0;
-            } else if (pl.upAxis == 2) {
-                right[0] = 0; right[1] = -1; right[2] = 0;
-                up[0] = 1; up[1] = 0; up[2] = 0;
+            float eye[3];
+            float target[3];
+            float up[3], right[3], axisForward[3];
+            axis_basis(pl.upAxis, right, up, axisForward);
+            if (pl.flyingCamera != 0) {
+                std::memcpy(eye, pl.flyPosition, sizeof(eye));
+                float direction[3];
+                camera_forward(pl.yaw, pl.pitch, pl.upAxis, direction);
+                for (int i = 0; i < 3; ++i) target[i] = eye[i] + direction[i];
+            } else {
+                orbit_eye(center, radius, pl.yaw, pl.pitch, pl.zoom, pl.upAxis, eye);
+                std::memcpy(target, center, sizeof(target));
             }
-            const float horizontal = std::cos(pitch);
-            const float eye[3] = {
-                ctr[0] + dist * (horizontal * std::sin(yaw) * right[0] +
-                    std::sin(pitch) * up[0] + horizontal * std::cos(yaw) * forward[0]),
-                ctr[1] + dist * (horizontal * std::sin(yaw) * right[1] +
-                    std::sin(pitch) * up[1] + horizontal * std::cos(yaw) * forward[1]),
-                ctr[2] + dist * (horizontal * std::sin(yaw) * right[2] +
-                    std::sin(pitch) * up[2] + horizontal * std::cos(yaw) * forward[2])};
-            const Mat4 view = mat_look_at(eye, ctr, up);
-            const Mat4 proj = mat_perspective(fov, w / h, std::max(radius * 0.01f, 0.01f), dist + radius * 4.0f);
+            const float cameraDx = eye[0] - center[0];
+            const float cameraDy = eye[1] - center[1];
+            const float cameraDz = eye[2] - center[2];
+            const float cameraDistance = std::sqrt(cameraDx * cameraDx + cameraDy * cameraDy +
+                cameraDz * cameraDz);
+            const float nearPlane = std::max(radius * 0.0001f, 0.01f);
+            const float farPlane = std::max({radius * 4.0f, cameraDistance + radius * 2.0f,
+                nearPlane + 1.0f});
+            const Mat4 view = mat_look_at(eye, target, up);
+            const Mat4 proj = mat_perspective(fov, w / h, nearPlane, farPlane);
             const Mat4 vp = mat_mul(proj, view);
             std::memcpy(un.viewProj, vp.m, sizeof(un.viewProj));
             const bool textured = pl.mode == 1 || pl.mode == 3;
@@ -879,7 +1085,8 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
         }
     }
     if (ready) {
-        draw_toolbar(pass, c->target_width, c->target_height, pl.mode, pl.upAxis, pl.hoverControl);
+        draw_toolbar(pass, c->target_width, c->target_height, pl.mode, pl.upAxis,
+            pl.hoverControl, pl.flyingCamera, pl.uvTex, pl.textureMenuOpen, pl.texturePage);
     }
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
@@ -901,6 +1108,7 @@ void on_window_event(ModContext*, WindowHandle, const WindowEvent* event, void*)
         g_previousF = false;
         g_previousLeftMouse = false;
         g_hoverControl = -1;
+        g_lastInputTime = {};
     }
 }
 
@@ -911,24 +1119,42 @@ void update_preview_input(ViewState& v) {
         g_previousF = false;
         g_previousLeftMouse = false;
         g_hoverControl = -1;
+        g_lastInputTime = {};
         return;
     }
     bool focused = info.focused;
     bool fDown = false;
     bool alt = false;
+    bool escapeDown = false;
     bool pointerInPreview = false;
     int mouseX = 0;
     int mouseY = 0;
     bool leftDown = false;
     bool rightDown = false;
     int clientWidth = 0;
+    int clientHeight = 0;
+    bool moveForward = false;
+    bool moveBackward = false;
+    bool moveLeft = false;
+    bool moveRight = false;
+    bool moveUp = false;
+    bool moveDown = false;
+    bool speedBoost = false;
 #if defined(_WIN32)
     HWND previewWindow = FindWindowW(nullptr, L"Model Preview");
     focused = focused && previewWindow != nullptr && GetForegroundWindow() == previewWindow;
     fDown = focused && (GetAsyncKeyState('F') & 0x8000) != 0;
     alt = focused && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    escapeDown = focused && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    moveForward = focused && (GetAsyncKeyState('W') & 0x8000) != 0;
+    moveBackward = focused && (GetAsyncKeyState('S') & 0x8000) != 0;
+    moveLeft = focused && (GetAsyncKeyState('A') & 0x8000) != 0;
+    moveRight = focused && (GetAsyncKeyState('D') & 0x8000) != 0;
+    moveDown = focused && (GetAsyncKeyState('Q') & 0x8000) != 0;
+    moveUp = focused && (GetAsyncKeyState('E') & 0x8000) != 0;
+    speedBoost = focused && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     POINT cursor{};
     RECT client{};
     if (focused && GetCursorPos(&cursor) && ScreenToClient(previewWindow, &cursor) &&
@@ -946,13 +1172,23 @@ void update_preview_input(ViewState& v) {
         mouseX = static_cast<int>(std::lround((cursor.x - client.left) * scaleX));
         mouseY = static_cast<int>(std::lround((cursor.y - client.top) * scaleY));
         clientWidth = info.pixel_width != 0 ? static_cast<int>(info.pixel_width) : rectWidth;
+        clientHeight = info.pixel_height != 0 ? static_cast<int>(info.pixel_height) : rectHeight;
     }
 #endif
+    const auto now = std::chrono::steady_clock::now();
+    float deltaSeconds = 1.0f / 60.0f;
+    if (g_lastInputTime.time_since_epoch().count() != 0) {
+        deltaSeconds = std::chrono::duration<float>(now - g_lastInputTime).count();
+        deltaSeconds = std::clamp(deltaSeconds, 0.0f, 0.1f);
+    }
+    g_lastInputTime = focused ? now : std::chrono::steady_clock::time_point{};
+
     if (fDown && !g_previousF) {
         v.yaw = 30.0f;
         v.pitch = 15;
         v.zoomPct = 100;
         v.autoRotate = false;
+        if (v.flyingCamera) v.flyPositionInitialized = false;
         g_dragMode = 0;
     }
     g_previousF = fDown;
@@ -964,8 +1200,41 @@ void update_preview_input(ViewState& v) {
         return;
     }
 
+    const std::shared_ptr<const MeshData> mesh = current_mesh();
+    const size_t textureCount = mesh ? mesh->textures.size() : 0;
+    const int pageCount = std::max(1, static_cast<int>(
+        (textureCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
+    v.texturePage = std::clamp(v.texturePage, 0, pageCount - 1);
+    if (v.flyingCamera && !v.flyPositionInitialized) initialize_fly_position(v);
+
     g_hoverControl = -1;
-    if (pointerInPreview && mouseY < toolbar_height(static_cast<float>(clientWidth))) {
+    if (pointerInPreview && v.textureMenuOpen && textureCount > 0) {
+        const TextureMenuLayout layout = texture_menu_layout(
+            static_cast<float>(clientWidth), static_cast<float>(clientHeight), textureCount, v.texturePage);
+        const bool insideMenu = mouseX >= layout.x && mouseX < layout.x + layout.width &&
+            mouseY >= layout.y && mouseY < layout.pagerY + (layout.hasPager ? 20.0f : 0.0f);
+        if (insideMenu) {
+            for (size_t row = 0; row < layout.rowCount; ++row) {
+                const float y = layout.y + 2.0f + static_cast<float>(row) * layout.rowHeight;
+                if (mouseY >= y && mouseY < y + layout.rowHeight - 1.0f) {
+                    g_hoverControl = kTextureRowFirstControl + static_cast<int32_t>(row);
+                    break;
+                }
+            }
+            if (layout.hasPager && mouseY >= layout.pagerY && mouseY < layout.pagerY + 20.0f) {
+                const float pagerWidth = (layout.width - 6.0f) * 0.5f;
+                if (mouseX >= layout.x + 2.0f &&
+                    mouseX < layout.x + 2.0f + pagerWidth) {
+                    g_hoverControl = kTexturePrevControl;
+                } else if (mouseX >= layout.x + 4.0f + pagerWidth &&
+                    mouseX < layout.x + layout.width - 2.0f) {
+                    g_hoverControl = kTextureNextControl;
+                }
+            }
+        }
+    }
+    if (g_hoverControl < 0 && pointerInPreview &&
+        mouseY < toolbar_height(static_cast<float>(clientWidth))) {
         const auto buttons = toolbar_buttons(static_cast<float>(clientWidth));
         for (const ToolbarButton& button : buttons) {
             if (mouseX >= button.x && mouseX < button.x + button.w &&
@@ -976,18 +1245,79 @@ void update_preview_input(ViewState& v) {
         }
     }
 
-    const bool toolbarClick = leftDown && !g_previousLeftMouse && pointerInPreview &&
+    const bool leftPressed = leftDown && !g_previousLeftMouse;
+    const bool toolbarClick = leftPressed && pointerInPreview &&
         g_hoverControl >= 0 && !alt;
     g_previousLeftMouse = leftDown;
     if (toolbarClick) {
-        if (g_hoverControl < 6) v.mode = g_hoverControl;
-        else v.upAxis = (v.upAxis + 1) % 3;
+        if (g_hoverControl < 6) {
+            v.mode = g_hoverControl;
+            v.textureMenuOpen = false;
+        } else if (g_hoverControl == kFlyControl) {
+            set_flying_camera(!v.flyingCamera);
+            if (v.flyingCamera) initialize_fly_position(v);
+        } else if (g_hoverControl == kAxisControl) {
+            v.upAxis = (v.upAxis + 1) % 3;
+        } else if (g_hoverControl == kTextureControl) {
+            v.textureMenuOpen = !v.textureMenuOpen;
+        } else if (g_hoverControl == kTexturePrevControl) {
+            v.texturePage = std::max(v.texturePage - 1, 0);
+        } else if (g_hoverControl == kTextureNextControl) {
+            v.texturePage = std::min(v.texturePage + 1, pageCount - 1);
+        } else if (g_hoverControl >= kTextureRowFirstControl) {
+            const size_t textureIndex = static_cast<size_t>(v.texturePage) * kTextureRowsPerPage +
+                static_cast<size_t>(g_hoverControl - kTextureRowFirstControl);
+            if (textureIndex < textureCount) {
+                v.uvTex = static_cast<int>(textureIndex);
+                v.mode = 5;
+            }
+            v.textureMenuOpen = false;
+        }
         g_dragMode = 0;
         return;
     }
+    if (leftPressed && v.textureMenuOpen &&
+        g_hoverControl != kTextureControl) {
+        v.textureMenuOpen = false;
+    }
+    if (escapeDown) v.textureMenuOpen = false;
+
+    if (v.flyingCamera && v.mode != 5) {
+        float center[3];
+        float radius = 1.0f;
+        mesh_sphere(mesh.get(), center, radius);
+        float right[3], up[3], axisForward[3];
+        axis_basis(static_cast<uint32_t>(std::clamp(v.upAxis, 0, 2)), right, up, axisForward);
+        const float yaw = v.yaw * 3.14159265f / 180.0f;
+        float forward[3];
+        for (int i = 0; i < 3; ++i) {
+            forward[i] = -(std::sin(yaw) * right[i] + std::cos(yaw) * axisForward[i]);
+        }
+        float side[3];
+        for (int i = 0; i < 3; ++i) {
+            side[i] = std::cos(yaw) * right[i] - std::sin(yaw) * axisForward[i];
+        }
+        float movement[3] = {0.0f, 0.0f, 0.0f};
+        const float forwardAmount = (moveForward ? 1.0f : 0.0f) - (moveBackward ? 1.0f : 0.0f);
+        const float sideAmount = (moveRight ? 1.0f : 0.0f) - (moveLeft ? 1.0f : 0.0f);
+        const float verticalAmount = (moveUp ? 1.0f : 0.0f) - (moveDown ? 1.0f : 0.0f);
+        for (int i = 0; i < 3; ++i) {
+            movement[i] = forward[i] * forwardAmount + side[i] * sideAmount + up[i] * verticalAmount;
+        }
+        const float movementLength = std::sqrt(movement[0] * movement[0] +
+            movement[1] * movement[1] + movement[2] * movement[2]);
+        if (movementLength > 0.0f) {
+            const float speed = std::clamp(radius * 0.05f, 2.0f, 200.0f) *
+                (speedBoost ? 4.0f : 1.0f);
+            for (int i = 0; i < 3; ++i) {
+                v.flyPosition[i] += movement[i] / movementLength * speed * deltaSeconds;
+            }
+            v.autoRotate = false;
+        }
+    }
 
     const int dragMode = pointerInPreview && alt && leftDown ? 1 :
-        pointerInPreview && rightDown ? 2 : 0;
+        pointerInPreview && rightDown ? (v.flyingCamera ? 1 : 2) : 0;
 
     if (dragMode == 0) {
         g_dragMode = 0;
@@ -1019,6 +1349,15 @@ void update_preview_input(ViewState& v) {
 
 bool preview_is_open() { return g_window != 0; }
 
+void set_flying_camera(bool enabled) {
+    ViewState& v = view();
+    if (v.flyingCamera == enabled) return;
+    v.flyingCamera = enabled;
+    v.flyPositionInitialized = false;
+    v.textureMenuOpen = false;
+    if (enabled) v.autoRotate = false;
+}
+
 ModResult preview_open() {
     if (g_window != 0) return MOD_OK;
     WindowDesc wd = WINDOW_DESC_INIT;
@@ -1048,6 +1387,7 @@ void preview_close() {
     g_previousF = false;
     g_previousLeftMouse = false;
     g_hoverControl = -1;
+    g_lastInputTime = {};
     if (g_target != 0) {
         if (svc_gfx->unregister_present_target(mod_ctx, g_target) == MOD_OK) g_target = 0;
     }
@@ -1060,7 +1400,8 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     if (g_target == 0) return;
     ViewState& v = view();
     update_preview_input(v);
-    if (v.autoRotate && v.mode != 5) {
+    if (v.flyingCamera && !v.flyPositionInitialized) initialize_fly_position(v);
+    if (v.autoRotate && v.mode != 5 && !v.flyingCamera) {
         v.yaw = std::fmod(v.yaw + 0.7f, 360.0f);
     }
     PresentPayload pl{};
@@ -1074,6 +1415,10 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     pl.uvTex = v.uvTex;
     pl.upAxis = static_cast<uint32_t>(std::clamp(v.upAxis, 0, 2));
     pl.hoverControl = g_hoverControl;
+    std::memcpy(pl.flyPosition, v.flyPosition, sizeof(pl.flyPosition));
+    pl.texturePage = v.texturePage;
+    pl.flyingCamera = v.flyingCamera ? 1u : 0u;
+    pl.textureMenuOpen = v.textureMenuOpen ? 1u : 0u;
     if (svc_gfx->push_present(mod_ctx, g_target, &pl, sizeof(pl)) == MOD_ERROR) {
         g_recreateTarget = true;
     }

@@ -274,6 +274,18 @@ void get_axis(ModContext*, void*, UiControlValue* out) { out->int_value = view()
 void set_axis(ModContext*, void*, const UiControlValue* v) {
     view().upAxis = std::clamp(static_cast<int>(v->int_value), 0, 2);
 }
+void get_flying_camera(ModContext*, void*, UiControlValue* out) {
+    out->bool_value = view().flyingCamera;
+}
+void set_flying_camera_control(ModContext*, void*, const UiControlValue* v) {
+    mi::set_flying_camera(v->bool_value);
+}
+void get_auto_rotate(ModContext*, void*, UiControlValue* out) {
+    out->bool_value = view().autoRotate;
+}
+void set_auto_rotate(ModContext*, void*, const UiControlValue* v) {
+    if (!view().flyingCamera) view().autoRotate = v->bool_value;
+}
 void on_toggle_preview(ModContext*, void*) {
     if (preview_is_open()) preview_close();
     else preview_open();
@@ -302,7 +314,18 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
     axis.option_count = sizeof(kAxes) / sizeof(kAxes[0]);
     svc_ui->pane_add_control(mod_ctx, left, &axis, nullptr);
 
-    add_toggle(left, "Auto-rotate", &v.autoRotate);
+    UiControlDesc fly = UI_CONTROL_DESC_INIT;
+    fly.kind = UI_CONTROL_TOGGLE;
+    fly.label = "Flying camera";
+    fly.get = get_flying_camera;
+    fly.set = set_flying_camera_control;
+    svc_ui->pane_add_control(mod_ctx, left, &fly, nullptr);
+    UiControlDesc rotate = UI_CONTROL_DESC_INIT;
+    rotate.kind = UI_CONTROL_TOGGLE;
+    rotate.label = "Auto-rotate";
+    rotate.get = get_auto_rotate;
+    rotate.set = set_auto_rotate;
+    svc_ui->pane_add_control(mod_ctx, left, &rotate, nullptr);
     add_number(left, "Yaw", get_yaw, set_yaw, nullptr, 0, 359, 10, " deg");
     add_number(left, "Pitch", get_int, set_int, &v.pitch, -89, 89, 5, " deg");
     add_number(left, "Zoom", get_int, set_int, &v.zoomPct, 10, 800, 10, " %");
@@ -310,8 +333,10 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
 
     svc_ui->pane_add_rml(mod_ctx, right,
         "Modes 0-4 show the 3D model, UV Map shows the unwrap of the selected shapes over a texture.<br/><br/>"
-        "Preview toolbar: click a mode or cycle the up axis. F focuses the model, Alt + left-drag rotates, "
-        "and right-drag zooms. "
+        "Preview toolbar: click a mode, choose an axis, toggle flying camera, or open the texture list "
+        "(choosing a texture switches to UV Map). "
+        "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "
+        "In flying mode, WASD moves, Q/E moves vertically, Shift speeds up, and mouse-drag looks around. "
         "Auto-rotate stops when you adjust the camera.", nullptr);
     return MOD_OK;
 }

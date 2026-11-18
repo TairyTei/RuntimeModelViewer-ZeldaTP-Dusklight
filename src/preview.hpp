@@ -7,6 +7,7 @@ namespace mi {
 ModResult preview_open();
 void preview_close();
 bool preview_is_open();
+void set_flying_camera(bool enabled);
 
 // Stage callback (register at GFX_STAGE_FRAME_AFTER_HUD): pushes one frame to the preview window.
 void preview_frame(ModContext* ctx, const GfxStageContext* stage, void* user);
