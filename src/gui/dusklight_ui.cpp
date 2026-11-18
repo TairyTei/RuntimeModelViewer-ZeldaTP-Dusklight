@@ -221,14 +221,17 @@ void on_model_row(ModContext*, UiListHandle, uint64_t key, void*) {
     ViewState& v = view();
     if (key == 0) {
         v.solo = -1;
+        v.shapeMenuOpen = false;
     } else if (key >= kTexKey) {
         v.uvTex = static_cast<int>(key - kTexKey);
         set_preview_layout(PreviewLayout::TwoD);
         v.textureMenuOpen = false;
+        v.shapeMenuOpen = false;
         set_flying_camera(false);
         set_live_update(false);
     } else if (key >= kShapeKey) {
         const int idx = static_cast<int>(key - kShapeKey);
+        v.shapeMenuOpen = false;
         if (v.solo == idx) {
             v.solo = -1;
         } else {
@@ -381,6 +384,7 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
         "Use the preview toolbar to choose 2D, 3D, or Both. Both splits the preview into equal 3D and UV panes. "
         "3D display modes are Solid, Textured, Solid + Wire, Textured + Wire, and Wire. "
         "Flying camera and live-pose controls are shown only in 3D; the UV pane has its own pan, zoom, and texture picker. "
+        "The SHAPE picker in the UV toolbar isolates a shape and selects its texture; ALL SHAPES clears the isolation. "
         "The U-/U+/V-/V+ preview buttons shift the UV unwrap by one tile relative to the selected texture. "
         "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance. "
         "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "

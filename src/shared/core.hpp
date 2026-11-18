@@ -57,6 +57,8 @@ struct ViewState {
     int uvTex = -1;        // texture index shown behind the UV map, -1 = none
     int texturePage = 0;
     bool textureMenuOpen = false;
+    int shapePage = 0;
+    bool shapeMenuOpen = false;
 };
 
 // ---- frame / registry (game thread) ----

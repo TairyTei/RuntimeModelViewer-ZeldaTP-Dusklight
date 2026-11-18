@@ -185,8 +185,10 @@ struct PresentPayload {
     int32_t uvTileOffsetY;
     float uvZoom;
     int32_t texturePage;
+    int32_t shapePage;
     uint32_t flyingCamera;
     uint32_t textureMenuOpen;
+    uint32_t shapeMenuOpen;
     uint32_t liveUpdate;
 };
 static_assert(sizeof(PresentPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
@@ -663,7 +665,11 @@ constexpr int32_t kUvTileUMinusControl = 12;
 constexpr int32_t kUvTileUPlusControl = 13;
 constexpr int32_t kUvTileVMinusControl = 14;
 constexpr int32_t kUvTileVPlusControl = 15;
+constexpr int32_t kShapeControl = 16;
+constexpr int32_t kShapePrevControl = 17;
+constexpr int32_t kShapeNextControl = 18;
 constexpr int32_t kTextureRowFirstControl = 100;
+constexpr int32_t kShapeRowFirstControl = 200;
 constexpr int32_t kTextureRowsPerPage = 8;
 
 struct ToolbarButton {
@@ -706,6 +712,9 @@ std::vector<ToolbarButton> toolbar_buttons(float width, PreviewLayout layout, ui
         const float regionWidth = layout == PreviewLayout::Both ? width * 0.5f : width;
         const float scale = std::clamp(regionWidth / 660.0f, 0.4f, 1.0f);
         float uvX = regionLeft + 7.0f * scale;
+        constexpr float shapeButtonWidth = 100.0f;
+        buttons.push_back({uvX, controlsY, shapeButtonWidth * scale, controlsH, kShapeControl});
+        uvX += (shapeButtonWidth + kToolbarGap) * scale;
         buttons.push_back({uvX, controlsY, kToolbarTextureWidth * scale,
             controlsH, kTextureControl});
         uvX += (kToolbarTextureWidth + kToolbarGap) * scale;
@@ -725,7 +734,7 @@ float toolbar_height(float, PreviewLayout, uint32_t) {
     return 62.0f;
 }
 
-struct TextureMenuLayout {
+struct PickerMenuLayout {
     float x = 0.0f;
     float y = 0.0f;
     float width = 164.0f;
@@ -737,10 +746,10 @@ struct TextureMenuLayout {
     bool hasPager = false;
 };
 
-TextureMenuLayout texture_menu_layout(float width, float height, size_t textureCount, int page,
-    PreviewLayout previewLayout) {
-    TextureMenuLayout layout{};
-    const size_t itemCount = textureCount;
+PickerMenuLayout picker_menu_layout(float width, float height, size_t itemCount, int page,
+    PreviewLayout previewLayout, int32_t controlId, float menuWidth) {
+    PickerMenuLayout layout{};
+    layout.width = menuWidth;
     layout.pageCount = std::max(1, static_cast<int>(
         (itemCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
     const int clampedPage = std::clamp(page, 0, layout.pageCount - 1);
@@ -751,7 +760,7 @@ TextureMenuLayout texture_menu_layout(float width, float height, size_t textureC
     layout.hasPager = layout.pageCount > 1;
     const auto buttons = toolbar_buttons(width, previewLayout, 0);
     for (const ToolbarButton& button : buttons) {
-        if (button.id == kTextureControl) {
+        if (button.id == controlId) {
             layout.x = button.x;
             break;
         }
@@ -817,6 +826,11 @@ uint8_t glyph_row(char ch, int row) {
     static constexpr uint8_t g[7] = {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E};
     static constexpr uint8_t h[7] = {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
     static constexpr uint8_t m[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
+    static constexpr uint8_t j[7] = {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C};
+    static constexpr uint8_t k[7] = {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11};
+    static constexpr uint8_t q[7] = {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D};
+    static constexpr uint8_t z[7] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F};
+    static constexpr uint8_t underscore[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F};
     if (row < 0 || row >= 7) return 0;
     const uint8_t* rows = nullptr;
     switch (ch) {
@@ -844,6 +858,11 @@ uint8_t glyph_row(char ch, int row) {
     case 'G': rows = g; break;
     case 'H': rows = h; break;
     case 'M': rows = m; break;
+    case 'J': rows = j; break;
+    case 'K': rows = k; break;
+    case 'Q': rows = q; break;
+    case 'Z': rows = z; break;
+    case '_': rows = underscore; break;
     case '0': rows = zero; break;
     case '1': rows = one; break;
     case '2': rows = two; break;
@@ -909,8 +928,9 @@ void append_triangle(std::vector<OverlayVertex>& vertices, float x0, float y0, f
 
 void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t targetHeight,
     PreviewLayout layout, uint32_t mode, uint32_t upAxis, int32_t hoverControl, uint32_t flyingCamera,
-    int32_t uvTex, int32_t uvTileOffsetX, int32_t uvTileOffsetY,
-    uint32_t textureMenuOpen, int32_t texturePage, uint32_t liveUpdate) {
+    int32_t solo, int32_t uvTex, int32_t uvTileOffsetX, int32_t uvTileOffsetY,
+    uint32_t textureMenuOpen, int32_t texturePage, uint32_t shapeMenuOpen, int32_t shapePage,
+    uint32_t liveUpdate) {
     if (g.pOverlay == nullptr || targetWidth == 0 || targetHeight == 0) return;
     static thread_local std::vector<OverlayVertex> vertices;
     vertices.clear();
@@ -927,6 +947,9 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
     char textureLabel[24] = {};
     if (uvTex >= 0) std::snprintf(textureLabel, sizeof(textureLabel), "TEX %02d", uvTex);
     else std::snprintf(textureLabel, sizeof(textureLabel), "TEX --");
+    char shapeLabel[24] = {};
+    if (solo >= 0) std::snprintf(shapeLabel, sizeof(shapeLabel), "SH %02d", solo);
+    else std::snprintf(shapeLabel, sizeof(shapeLabel), "SHAPE");
     append_rect(vertices, 0, 0, width, toolbar_height(width, layout, mode), width, height, toolbarBg);
     if (layout == PreviewLayout::Both) {
         const float divider[4] = {0.22f, 0.25f, 0.30f, 1.0f};
@@ -941,7 +964,8 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             (button.id == kLayout3DControl && layout == PreviewLayout::ThreeD) ||
             (button.id == kLayoutBothControl && layout == PreviewLayout::Both) ||
             (button.id == kFlyControl && flyingCamera != 0) ||
-            (button.id == kTextureControl && textureMenuOpen != 0);
+            (button.id == kTextureControl && textureMenuOpen != 0) ||
+            (button.id == kShapeControl && shapeMenuOpen != 0);
         const float* fill = button.id == hoverControl ? hoverBg :
             button.id == kLiveControl && liveUpdate != 0 ? liveBg : active ? activeBg : buttonBg;
         append_rect(vertices, button.x, button.y, button.x + button.w, button.y + button.h,
@@ -974,6 +998,7 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             button.id == kLayoutBothControl ? "BOTH" :
             button.id == kFlyControl ? "FLY" :
             button.id == kAxisControl ? axis_label(upAxis) :
+            button.id == kShapeControl ? shapeLabel :
             button.id == kUvTileUMinusControl ? "U-" :
             button.id == kUvTileUPlusControl ? "U+" :
             button.id == kUvTileVMinusControl ? "V-" :
@@ -1001,8 +1026,8 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
 
     if (layout != PreviewLayout::ThreeD && textureMenuOpen != 0 &&
         g.mesh != nullptr && !g.mesh->textures->empty()) {
-        const TextureMenuLayout menuLayout = texture_menu_layout(
-            width, height, g.mesh->textures->size(), texturePage, layout);
+        const PickerMenuLayout menuLayout = picker_menu_layout(
+            width, height, g.mesh->textures->size(), texturePage, layout, kTextureControl, 164.0f);
         const float menuBg[4] = {0.055f, 0.065f, 0.085f, 1.0f};
         const float rowBg[4] = {0.12f, 0.14f, 0.18f, 1.0f};
         const float selectedBg[4] = {0.10f, 0.32f, 0.53f, 1.0f};
@@ -1030,6 +1055,57 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             const float pagerWidth = (menuLayout.width - 6.0f) * 0.5f;
             const float* prevFill = hoverControl == kTexturePrevControl ? hoverBg : rowBg;
             const float* nextFill = hoverControl == kTextureNextControl ? hoverBg : rowBg;
+            append_rect(vertices, menuLayout.x + 2.0f, menuLayout.pagerY,
+                menuLayout.x + 2.0f + pagerWidth, menuLayout.pagerY + 20.0f, width, height, prevFill);
+            append_rect(vertices, menuLayout.x + 4.0f + pagerWidth, menuLayout.pagerY,
+                menuLayout.x + menuLayout.width - 2.0f, menuLayout.pagerY + 20.0f, width, height, nextFill);
+            append_text(vertices, "PREV", menuLayout.x + 8.0f, menuLayout.pagerY + 6.0f,
+                1.0f, width, height, textColor);
+            append_text(vertices, "NEXT", menuLayout.x + 12.0f + pagerWidth, menuLayout.pagerY + 6.0f,
+                1.0f, width, height, textColor);
+        }
+    }
+    if (layout != PreviewLayout::ThreeD && shapeMenuOpen != 0 && g.mesh != nullptr) {
+        const size_t itemCount = g.mesh->subs.size() + 1;
+        const PickerMenuLayout menuLayout = picker_menu_layout(
+            width, height, itemCount, shapePage, layout, kShapeControl, 220.0f);
+        const float menuBg[4] = {0.055f, 0.065f, 0.085f, 1.0f};
+        const float rowBg[4] = {0.12f, 0.14f, 0.18f, 1.0f};
+        const float selectedBg[4] = {0.10f, 0.32f, 0.53f, 1.0f};
+        append_rect(vertices, menuLayout.x, menuLayout.y, menuLayout.x + menuLayout.width,
+            menuLayout.pagerY + (menuLayout.hasPager ? 24.0f : 4.0f), width, height, menuBg);
+        for (size_t row = 0; row < menuLayout.rowCount; ++row) {
+            const size_t index = menuLayout.first + row;
+            const float y = menuLayout.y + 2.0f + static_cast<float>(row) * menuLayout.rowHeight;
+            const int32_t control = kShapeRowFirstControl + static_cast<int32_t>(row);
+            char label[64];
+            bool selected = solo < 0 && index == 0;
+            if (index == 0) {
+                std::snprintf(label, sizeof(label), "ALL SHAPES");
+            } else {
+                const SubMesh& sub = g.mesh->subs[index - 1];
+                char shapeName[25] = {};
+                const std::string& sourceName = sub.label;
+                const size_t nameLength = std::min(sourceName.size(), sizeof(shapeName) - 1);
+                for (size_t i = 0; i < nameLength; ++i) {
+                    char ch = sourceName[i];
+                    if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+                    shapeName[i] = ch;
+                }
+                std::snprintf(label, sizeof(label), "SH %02u %s", sub.shapeIndex,
+                    shapeName[0] == '\0' ? "-" : shapeName);
+                selected = solo == static_cast<int32_t>(sub.shapeIndex);
+            }
+            const float* fill = control == hoverControl ? hoverBg : selected ? selectedBg : rowBg;
+            append_rect(vertices, menuLayout.x + 2.0f, y, menuLayout.x + menuLayout.width - 2.0f,
+                y + menuLayout.rowHeight - 1.0f, width, height, fill);
+            append_text(vertices, label, menuLayout.x + 8.0f, y + 6.0f, 1.0f,
+                width, height, textColor);
+        }
+        if (menuLayout.hasPager) {
+            const float pagerWidth = (menuLayout.width - 6.0f) * 0.5f;
+            const float* prevFill = hoverControl == kShapePrevControl ? hoverBg : rowBg;
+            const float* nextFill = hoverControl == kShapeNextControl ? hoverBg : rowBg;
             append_rect(vertices, menuLayout.x + 2.0f, menuLayout.pagerY,
                 menuLayout.x + 2.0f + pagerWidth, menuLayout.pagerY + 20.0f, width, height, prevFill);
             append_rect(vertices, menuLayout.x + 4.0f + pagerWidth, menuLayout.pagerY,
@@ -1208,10 +1284,10 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
         std::memcpy(un.viewProj, vp.m, sizeof(un.viewProj));
         const bool textured = pl.mode == 1 || pl.mode == 3;
         un.p0[0] = textured ? 1.0f : 0.0f;
-        un.color[0] = 0.92f;
-        un.color[1] = 0.95f;
-        un.color[2] = 1.0f;
-        un.color[3] = 0.82f;
+        un.color[0] = 0.0f;
+        un.color[1] = 0.0f;
+        un.color[2] = 0.0f;
+        un.color[3] = 0.5f;
         wgpuQueueWriteBuffer(g.queue, g.ubuf, 0, &un, sizeof(un));
         const bool solid = pl.mode <= 3;
         const bool wire = pl.mode >= 2;
@@ -1312,8 +1388,9 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
 
     if (ready) {
         draw_toolbar(pass, c->target_width, c->target_height, layout, pl.mode, pl.upAxis,
-            pl.hoverControl, pl.flyingCamera, pl.uvTex, pl.uvTileOffsetX, pl.uvTileOffsetY,
-            pl.textureMenuOpen, pl.texturePage, pl.liveUpdate);
+            pl.hoverControl, pl.flyingCamera, pl.solo, pl.uvTex,
+            pl.uvTileOffsetX, pl.uvTileOffsetY, pl.textureMenuOpen, pl.texturePage,
+            pl.shapeMenuOpen, pl.shapePage, pl.liveUpdate);
     }
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
@@ -1434,17 +1511,21 @@ void update_preview_input(ViewState& v) {
 
     const std::shared_ptr<const MeshData> mesh = current_mesh();
     const size_t textureCount = mesh ? mesh->textures->size() : 0;
+    const size_t shapeItemCount = mesh ? mesh->subs.size() + 1 : 0;
     const int pageCount = std::max(1, static_cast<int>(
         (textureCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
+    const int shapePageCount = std::max(1, static_cast<int>(
+        (shapeItemCount + static_cast<size_t>(kTextureRowsPerPage) - 1) / kTextureRowsPerPage));
     v.texturePage = std::clamp(v.texturePage, 0, pageCount - 1);
+    v.shapePage = std::clamp(v.shapePage, 0, shapePageCount - 1);
     if (v.flyingCamera && !v.flyPositionInitialized) initialize_fly_position(v);
 
     g_hoverControl = -1;
     if (pointerInPreview && v.layout != PreviewLayout::ThreeD &&
         v.textureMenuOpen && textureCount > 0) {
-        const TextureMenuLayout layout = texture_menu_layout(
+        const PickerMenuLayout layout = picker_menu_layout(
             static_cast<float>(clientWidth), static_cast<float>(clientHeight), textureCount,
-            v.texturePage, v.layout);
+            v.texturePage, v.layout, kTextureControl, 164.0f);
         const bool insideMenu = mouseX >= layout.x && mouseX < layout.x + layout.width &&
             mouseY >= layout.y && mouseY < layout.pagerY + (layout.hasPager ? 20.0f : 0.0f);
         if (insideMenu) {
@@ -1463,6 +1544,33 @@ void update_preview_input(ViewState& v) {
                 } else if (mouseX >= layout.x + 4.0f + pagerWidth &&
                     mouseX < layout.x + layout.width - 2.0f) {
                     g_hoverControl = kTextureNextControl;
+                }
+            }
+        }
+    }
+    if (g_hoverControl < 0 && pointerInPreview && v.layout != PreviewLayout::ThreeD &&
+        v.shapeMenuOpen && shapeItemCount > 0) {
+        const PickerMenuLayout layout = picker_menu_layout(
+            static_cast<float>(clientWidth), static_cast<float>(clientHeight), shapeItemCount,
+            v.shapePage, v.layout, kShapeControl, 220.0f);
+        const bool insideMenu = mouseX >= layout.x && mouseX < layout.x + layout.width &&
+            mouseY >= layout.y && mouseY < layout.pagerY + (layout.hasPager ? 20.0f : 0.0f);
+        if (insideMenu) {
+            for (size_t row = 0; row < layout.rowCount; ++row) {
+                const float y = layout.y + 2.0f + static_cast<float>(row) * layout.rowHeight;
+                if (mouseY >= y && mouseY < y + layout.rowHeight - 1.0f) {
+                    g_hoverControl = kShapeRowFirstControl + static_cast<int32_t>(row);
+                    break;
+                }
+            }
+            if (layout.hasPager && mouseY >= layout.pagerY && mouseY < layout.pagerY + 20.0f) {
+                const float pagerWidth = (layout.width - 6.0f) * 0.5f;
+                if (mouseX >= layout.x + 2.0f &&
+                    mouseX < layout.x + 2.0f + pagerWidth) {
+                    g_hoverControl = kShapePrevControl;
+                } else if (mouseX >= layout.x + 4.0f + pagerWidth &&
+                    mouseX < layout.x + layout.width - 2.0f) {
+                    g_hoverControl = kShapeNextControl;
                 }
             }
         }
@@ -1489,6 +1597,7 @@ void update_preview_input(ViewState& v) {
         if (g_hoverControl < 5) {
             v.mode = g_hoverControl;
             v.textureMenuOpen = false;
+            v.shapeMenuOpen = false;
         } else if (g_hoverControl == kLayout2DControl) {
             set_preview_layout(PreviewLayout::TwoD);
         } else if (g_hoverControl == kLayout3DControl) {
@@ -1510,19 +1619,41 @@ void update_preview_input(ViewState& v) {
             v.uvTileOffsetY = std::min(v.uvTileOffsetY + 1, 9999);
         } else if (g_hoverControl == kTextureControl) {
             v.textureMenuOpen = !v.textureMenuOpen;
+            v.shapeMenuOpen = false;
+        } else if (g_hoverControl == kShapeControl) {
+            v.shapeMenuOpen = !v.shapeMenuOpen;
+            v.textureMenuOpen = false;
         } else if (g_hoverControl == kLiveControl) {
             set_live_update(!v.liveUpdate);
         } else if (g_hoverControl == kTexturePrevControl) {
             v.texturePage = std::max(v.texturePage - 1, 0);
         } else if (g_hoverControl == kTextureNextControl) {
             v.texturePage = std::min(v.texturePage + 1, pageCount - 1);
-        } else if (g_hoverControl >= kTextureRowFirstControl) {
+        } else if (g_hoverControl == kShapePrevControl) {
+            v.shapePage = std::max(v.shapePage - 1, 0);
+        } else if (g_hoverControl == kShapeNextControl) {
+            v.shapePage = std::min(v.shapePage + 1, shapePageCount - 1);
+        } else if (g_hoverControl >= kTextureRowFirstControl &&
+            g_hoverControl < kShapeRowFirstControl) {
             const size_t textureIndex = static_cast<size_t>(v.texturePage) * kTextureRowsPerPage +
                 static_cast<size_t>(g_hoverControl - kTextureRowFirstControl);
             if (textureIndex < textureCount) {
                 v.uvTex = static_cast<int>(textureIndex);
             }
             v.textureMenuOpen = false;
+        } else if (g_hoverControl >= kShapeRowFirstControl &&
+            g_hoverControl < kShapeRowFirstControl + kTextureRowsPerPage) {
+            const size_t shapeIndex = static_cast<size_t>(v.shapePage) * kTextureRowsPerPage +
+                static_cast<size_t>(g_hoverControl - kShapeRowFirstControl);
+            if (shapeIndex == 0) {
+                v.solo = -1;
+                v.uvTex = -1;
+            } else if (shapeIndex < shapeItemCount && mesh != nullptr) {
+                const SubMesh& sub = mesh->subs[shapeIndex - 1];
+                v.solo = static_cast<int32_t>(sub.shapeIndex);
+                v.uvTex = sub.texture;
+            }
+            v.shapeMenuOpen = false;
         }
         g_dragMode = 0;
         return;
@@ -1531,7 +1662,13 @@ void update_preview_input(ViewState& v) {
         g_hoverControl != kTextureControl) {
         v.textureMenuOpen = false;
     }
-    if (escapeDown) v.textureMenuOpen = false;
+    if (leftPressed && v.shapeMenuOpen && g_hoverControl != kShapeControl) {
+        v.shapeMenuOpen = false;
+    }
+    if (escapeDown) {
+        v.textureMenuOpen = false;
+        v.shapeMenuOpen = false;
+    }
 
     if (v.flyingCamera && v.layout != PreviewLayout::TwoD) {
         float center[3];
@@ -1631,6 +1768,7 @@ void set_flying_camera(bool enabled) {
     v.flyingCamera = enabled;
     v.flyPositionInitialized = false;
     v.textureMenuOpen = false;
+    v.shapeMenuOpen = false;
     if (enabled) v.autoRotate = false;
 }
 
@@ -1645,11 +1783,12 @@ void set_live_update(bool enabled) {
 void set_preview_layout(PreviewLayout layout) {
     ViewState& v = view();
     v.layout = layout;
+    v.textureMenuOpen = false;
+    v.shapeMenuOpen = false;
     if (layout == PreviewLayout::TwoD) {
         set_flying_camera(false);
         set_live_update(false);
     }
-    if (layout == PreviewLayout::ThreeD) v.textureMenuOpen = false;
 }
 
 ModResult preview_open() {
@@ -1722,8 +1861,10 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     pl.hoverControl = g_hoverControl;
     std::memcpy(pl.flyPosition, v.flyPosition, sizeof(pl.flyPosition));
     pl.texturePage = v.texturePage;
+    pl.shapePage = v.shapePage;
     pl.flyingCamera = v.flyingCamera ? 1u : 0u;
     pl.textureMenuOpen = v.textureMenuOpen ? 1u : 0u;
+    pl.shapeMenuOpen = v.shapeMenuOpen ? 1u : 0u;
     pl.liveUpdate = v.liveUpdate ? 1u : 0u;
     pl.uvPanX = v.uvPanX;
     pl.uvPanY = v.uvPanY;
