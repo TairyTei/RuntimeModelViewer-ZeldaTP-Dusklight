@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdint>
+
 #include "mods/api.h"
 
 struct GfxStageContext;
@@ -6,10 +8,12 @@ struct GfxStageContext;
 namespace mi {
 
 enum class PreviewLayout : int;
+using PreviewExportHandler = void (*)(int32_t soloShape);
 
 ModResult preview_open();
 void preview_close();
 bool preview_is_open();
+void preview_set_export_handler(PreviewExportHandler handler);
 void set_flying_camera(bool enabled);
 void set_live_update(bool enabled);
 void set_preview_layout(PreviewLayout layout);

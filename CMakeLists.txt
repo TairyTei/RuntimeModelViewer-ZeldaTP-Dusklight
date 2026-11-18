@@ -62,8 +62,13 @@ target_link_libraries(mi_preview
 )
 _mod_add_webgpu_headers(mi_preview)
 
-mi_add_component(mi_app src/app/inspector_service.cpp)
-target_link_libraries(mi_app PUBLIC mi_shared mi_preview)
+mi_add_component(mi_gltf_export src/export/glb_exporter.cpp)
+
+mi_add_component(mi_app
+        src/app/inspector_service.cpp
+        src/app/export_service.cpp
+)
+target_link_libraries(mi_app PUBLIC mi_shared mi_preview mi_gltf_export)
 
 mi_add_component(mi_gui src/gui/dusklight_ui.cpp)
 target_link_libraries(mi_gui PUBLIC mi_app dusklight_mod_api)
@@ -83,3 +88,11 @@ target_link_libraries(runtimeviewer PRIVATE
         mi_preview
         mi_shared
 )
+
+option(MI_BUILD_TESTS "Build Model Inspector unit tests" OFF)
+if (MI_BUILD_TESTS)
+    enable_testing()
+    add_executable(mi_glb_export_test tests/glb_export_test.cpp)
+    target_link_libraries(mi_glb_export_test PRIVATE mi_gltf_export)
+    add_test(NAME glb_exporter COMMAND mi_glb_export_test)
+endif ()

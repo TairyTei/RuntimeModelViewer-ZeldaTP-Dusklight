@@ -383,8 +383,9 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
     svc_ui->pane_add_rml(mod_ctx, right,
         "Use the preview toolbar to choose 2D, 3D, or Both. Both splits the preview into equal 3D and UV panes. "
         "3D display modes are Solid, Textured, Solid + Wire, Textured + Wire, and Wire. "
+        "EXPORT writes the selected shape, or all shapes, as a textured GLB after you choose a destination folder. "
         "Flying camera and live-pose controls are shown only in 3D; the UV pane has its own pan, zoom, and texture picker. "
-        "The SHAPE picker in the UV toolbar isolates a shape and selects its texture; ALL SHAPES clears the isolation. "
+        "The SHAPES picker in the 3D toolbar isolates a shape and selects its texture; ALL SHAPES clears the isolation. "
         "The U-/U+/V-/V+ preview buttons shift the UV unwrap by one tile relative to the selected texture. "
         "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance. "
         "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "

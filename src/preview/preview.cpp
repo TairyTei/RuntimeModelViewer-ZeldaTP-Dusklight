@@ -37,7 +37,7 @@ namespace {
 const char* kShader = R"WGSL(
 struct U {
   view_proj : mat4x4<f32>,
-  p0 : vec4<f32>,     // x: 1 = use texture colour
+  p0 : vec4<f32>,     // x: textured; y: opaque or blended texture pass
   uvxf : vec4<f32>,   // uv -> ndc: xy scale, zw offset
   color : vec4<f32>,  // wire colour
 };
@@ -78,8 +78,17 @@ struct MeshOut {
 @fragment fn fs_mesh(i : MeshOut) -> @location(0) vec4<f32> {
   let t = textureSample(tex, smp, i.uv);
   if (u.p0.x > 0.5) {
-    if (t.a < 0.1) {
-      discard;
+    if (u.p0.y > 1.5) {
+      if (t.a <= 0.0 || t.a >= 1.0) {
+        discard;
+      }
+      return t;
+    }
+    if (u.p0.y > 0.5) {
+      if (t.a < 1.0) {
+        discard;
+      }
+      return vec4<f32>(t.rgb, 1.0);
     }
     return vec4<f32>(t.rgb, 1.0);
   }
@@ -213,6 +222,7 @@ int g_previousMouseY = 0;
 int32_t g_hoverControl = -1;
 std::chrono::steady_clock::time_point g_lastInputTime{};
 std::chrono::steady_clock::time_point g_nextLiveSnapshot{};
+PreviewExportHandler g_exportHandler = nullptr;
 
 // ---------------------------------------------------------------------------------------------
 // GPU state (render worker thread; released from the game thread at shutdown)
@@ -223,10 +233,12 @@ struct Gpu {
     WGPUTextureFormat colorFormat = WGPUTextureFormat_Undefined;
 
     WGPUShaderModule module = nullptr;
-    WGPURenderPipeline pTri = nullptr, pWire = nullptr, pUvBg = nullptr, pUvWire = nullptr, pOverlay = nullptr;
-    WGPUBindGroupLayout lTri = nullptr, lWire = nullptr, lUvBg = nullptr, lUvWire = nullptr;
+    WGPURenderPipeline pTri = nullptr, pTriAlpha = nullptr, pWire = nullptr, pUvBg = nullptr,
+        pUvWire = nullptr, pOverlay = nullptr;
+    WGPUBindGroupLayout lTri = nullptr, lTriAlpha = nullptr, lWire = nullptr, lUvBg = nullptr,
+        lUvWire = nullptr;
 
-    WGPUBuffer ubuf = nullptr, uvUbuf = nullptr, uvWireUbuf = nullptr;
+    WGPUBuffer ubuf = nullptr, alphaUbuf = nullptr, uvUbuf = nullptr, uvWireUbuf = nullptr;
     WGPUBuffer overlayBuffer = nullptr;
     uint64_t overlayBufferSize = 0;
     WGPUSampler sampLinear = nullptr, sampNearest = nullptr;
@@ -269,8 +281,8 @@ void release_mesh_gpu() {
 }
 
 void release_pipelines() {
-    rel(g.pTri); rel(g.pWire); rel(g.pUvBg); rel(g.pUvWire); rel(g.pOverlay);
-    rel(g.lTri); rel(g.lWire); rel(g.lUvBg); rel(g.lUvWire);
+    rel(g.pTri); rel(g.pTriAlpha); rel(g.pWire); rel(g.pUvBg); rel(g.pUvWire); rel(g.pOverlay);
+    rel(g.lTri); rel(g.lTriAlpha); rel(g.lWire); rel(g.lUvBg); rel(g.lUvWire);
     rel(g.module);
     g.colorFormat = WGPUTextureFormat_Undefined;
 }
@@ -287,6 +299,7 @@ void release_all_gpu() {
     rel(g.overlayBuffer);
     g.overlayBufferSize = 0;
     rel(g.ubuf);
+    rel(g.alphaUbuf);
     rel(g.uvUbuf);
     rel(g.uvWireUbuf);
     g.device = nullptr;
@@ -432,7 +445,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
         g.device = c.device;
         g.queue = c.queue;
     }
-    if (g.ubuf == nullptr || g.uvUbuf == nullptr || g.uvWireUbuf == nullptr ||
+    if (g.ubuf == nullptr || g.alphaUbuf == nullptr || g.uvUbuf == nullptr ||
+        g.uvWireUbuf == nullptr ||
         g.sampLinear == nullptr || g.sampNearest == nullptr ||
         g.viewGray == nullptr || g.viewDark == nullptr) {
         WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
@@ -440,6 +454,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
         bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
         bd.size = kUniformSize;
         if (g.ubuf == nullptr) g.ubuf = wgpuDeviceCreateBuffer(g.device, &bd);
+        bd.label = {"inspector alpha uniforms", WGPU_STRLEN};
+        if (g.alphaUbuf == nullptr) g.alphaUbuf = wgpuDeviceCreateBuffer(g.device, &bd);
         bd.label = {"inspector UV uniforms", WGPU_STRLEN};
         if (g.uvUbuf == nullptr) g.uvUbuf = wgpuDeviceCreateBuffer(g.device, &bd);
         bd.label = {"inspector UV wire uniforms", WGPU_STRLEN};
@@ -458,11 +474,13 @@ bool ensure_gpu(const GfxPresentContext& c) {
             rel(g.texDark);
             create_rgba(1, 1, dark, g.texDark, g.viewDark);
         }
-        if (g.ubuf == nullptr || g.uvUbuf == nullptr || g.uvWireUbuf == nullptr ||
+        if (g.ubuf == nullptr || g.alphaUbuf == nullptr || g.uvUbuf == nullptr ||
+            g.uvWireUbuf == nullptr ||
             g.sampLinear == nullptr || g.sampNearest == nullptr ||
             g.viewGray == nullptr || g.viewDark == nullptr) return false;
     }
-    if (g.pTri != nullptr && g.pOverlay != nullptr && g.colorFormat == c.target_format) return true;
+    if (g.pTri != nullptr && g.pTriAlpha != nullptr && g.pOverlay != nullptr &&
+        g.colorFormat == c.target_format) return true;
 
     release_pipelines();
     g.colorFormat = c.target_format;
@@ -476,6 +494,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
 
     g.pTri = make_pipeline("inspector solid", "vs_mesh", "fs_mesh", WGPUPrimitiveTopology_TriangleList,
         true, true, true);
+    g.pTriAlpha = make_pipeline("inspector textured alpha", "vs_mesh", "fs_mesh",
+        WGPUPrimitiveTopology_TriangleList, true, true, false, true);
     g.pWire = make_pipeline("inspector wire", "vs_wire", "fs_wire", WGPUPrimitiveTopology_LineList,
         true, true, false, true);
     g.pUvBg = make_pipeline("inspector uv bg", "vs_quad", "fs_quad",
@@ -483,12 +503,13 @@ bool ensure_gpu(const GfxPresentContext& c) {
     g.pUvWire = make_pipeline("inspector uv wire", "vs_uvwire", "fs_uvwire",
         WGPUPrimitiveTopology_LineList, true, false, false);
     g.pOverlay = make_overlay_pipeline();
-    if (!g.pTri || !g.pWire || !g.pUvBg || !g.pUvWire || !g.pOverlay) {
+    if (!g.pTri || !g.pTriAlpha || !g.pWire || !g.pUvBg || !g.pUvWire || !g.pOverlay) {
         logf(2, "FAILED to create WebGPU pipelines!");
         release_pipelines();
         return false;
     }
     g.lTri = wgpuRenderPipelineGetBindGroupLayout(g.pTri, 0);
+    g.lTriAlpha = wgpuRenderPipelineGetBindGroupLayout(g.pTriAlpha, 0);
     g.lWire = wgpuRenderPipelineGetBindGroupLayout(g.pWire, 0);
     g.lUvBg = wgpuRenderPipelineGetBindGroupLayout(g.pUvBg, 0);
     g.lUvWire = wgpuRenderPipelineGetBindGroupLayout(g.pUvWire, 0);
@@ -651,6 +672,8 @@ constexpr float kToolbarAxisWidth = 74.0f;
 constexpr float kToolbarFlyWidth = 52.0f;
 constexpr float kToolbarTextureWidth = 142.0f;
 constexpr float kToolbarLiveWidth = 36.0f;
+constexpr float kToolbarExportWidth = 88.0f;
+constexpr float kToolbarShapeWidth = 100.0f;
 constexpr float kToolbarGap = 5.0f;
 constexpr int32_t kLayout2DControl = 20;
 constexpr int32_t kLayout3DControl = 21;
@@ -668,6 +691,7 @@ constexpr int32_t kUvTileVPlusControl = 15;
 constexpr int32_t kShapeControl = 16;
 constexpr int32_t kShapePrevControl = 17;
 constexpr int32_t kShapeNextControl = 18;
+constexpr int32_t kExportControl = 19;
 constexpr int32_t kTextureRowFirstControl = 100;
 constexpr int32_t kShapeRowFirstControl = 200;
 constexpr int32_t kTextureRowsPerPage = 8;
@@ -693,8 +717,14 @@ std::vector<ToolbarButton> toolbar_buttons(float width, PreviewLayout layout, ui
     const float controlsH = 25.0f;
     if (layout != PreviewLayout::TwoD) {
         const float regionWidth = layout == PreviewLayout::Both ? width * 0.5f : width;
-        const float scale = std::clamp(regionWidth / 660.0f, 0.4f, 1.0f);
+        const float scale = std::clamp(regionWidth / 850.0f, 0.3f, 1.0f);
         float controlX = 7.0f * scale;
+        buttons.push_back({controlX, controlsY, kToolbarExportWidth * scale, controlsH,
+            kExportControl});
+        controlX += (kToolbarExportWidth + kToolbarGap) * scale;
+        buttons.push_back({controlX, controlsY, kToolbarShapeWidth * scale, controlsH,
+            kShapeControl});
+        controlX += (kToolbarShapeWidth + kToolbarGap) * scale;
         for (int32_t i = 0; i < 5; ++i) {
             const float buttonWidth = kToolbarModeWidths[i] * scale;
             buttons.push_back({controlX, controlsY, buttonWidth, controlsH, i});
@@ -712,9 +742,6 @@ std::vector<ToolbarButton> toolbar_buttons(float width, PreviewLayout layout, ui
         const float regionWidth = layout == PreviewLayout::Both ? width * 0.5f : width;
         const float scale = std::clamp(regionWidth / 660.0f, 0.4f, 1.0f);
         float uvX = regionLeft + 7.0f * scale;
-        constexpr float shapeButtonWidth = 100.0f;
-        buttons.push_back({uvX, controlsY, shapeButtonWidth * scale, controlsH, kShapeControl});
-        uvX += (shapeButtonWidth + kToolbarGap) * scale;
         buttons.push_back({uvX, controlsY, kToolbarTextureWidth * scale,
             controlsH, kTextureControl});
         uvX += (kToolbarTextureWidth + kToolbarGap) * scale;
@@ -765,8 +792,17 @@ PickerMenuLayout picker_menu_layout(float width, float height, size_t itemCount,
             break;
         }
     }
-    const float regionLeft = previewLayout == PreviewLayout::Both ? width * 0.5f : 0.0f;
-    const float regionWidth = previewLayout == PreviewLayout::Both ? width * 0.5f : width;
+    float regionLeft = 0.0f;
+    float regionWidth = width;
+    for (const ToolbarButton& button : buttons) {
+        if (button.id == controlId) {
+            if (previewLayout == PreviewLayout::Both && button.x >= width * 0.5f) {
+                regionLeft = width * 0.5f;
+                regionWidth = width * 0.5f;
+            }
+            break;
+        }
+    }
     if (layout.width > regionWidth - 8.0f) layout.width = std::max(80.0f, regionWidth - 8.0f);
     if (layout.x + layout.width > regionLeft + regionWidth - 4.0f) {
         layout.x = std::max(regionLeft + 4.0f, regionLeft + regionWidth - layout.width - 4.0f);
@@ -996,6 +1032,7 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             button.id == kLayout2DControl ? "2D" :
             button.id == kLayout3DControl ? "3D" :
             button.id == kLayoutBothControl ? "BOTH" :
+            button.id == kExportControl ? "EXPORT" :
             button.id == kFlyControl ? "FLY" :
             button.id == kAxisControl ? axis_label(upAxis) :
             button.id == kShapeControl ? shapeLabel :
@@ -1003,8 +1040,10 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
             button.id == kUvTileUPlusControl ? "U+" :
             button.id == kUvTileVMinusControl ? "V-" :
             button.id == kUvTileVPlusControl ? "V+" : textureLabel;
-        const float fontScale = std::min(2.0f, button.h / 14.0f);
-        const float textWidth = (static_cast<float>(std::strlen(label)) * 6.0f - 1.0f) * fontScale;
+        const float glyphWidth = static_cast<float>(std::strlen(label)) * 6.0f - 1.0f;
+        const float fontScale = std::min({2.0f, button.h / 14.0f,
+            std::max(0.1f, (button.w - 6.0f) / glyphWidth)});
+        const float textWidth = glyphWidth * fontScale;
         const float textHeight = 7.0f * fontScale;
         const float textX = button.x + (button.w - textWidth) * 0.5f;
         const float textY = button.y + (button.h - textHeight) * 0.5f;
@@ -1065,7 +1104,7 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
                 1.0f, width, height, textColor);
         }
     }
-    if (layout != PreviewLayout::ThreeD && shapeMenuOpen != 0 && g.mesh != nullptr) {
+    if (layout != PreviewLayout::TwoD && shapeMenuOpen != 0 && g.mesh != nullptr) {
         const size_t itemCount = g.mesh->subs.size() + 1;
         const PickerMenuLayout menuLayout = picker_menu_layout(
             width, height, itemCount, shapePage, layout, kShapeControl, 220.0f);
@@ -1284,11 +1323,17 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
         std::memcpy(un.viewProj, vp.m, sizeof(un.viewProj));
         const bool textured = pl.mode == 1 || pl.mode == 3;
         un.p0[0] = textured ? 1.0f : 0.0f;
+        un.p0[1] = textured ? 1.0f : 0.0f;
         un.color[0] = 0.0f;
         un.color[1] = 0.0f;
         un.color[2] = 0.0f;
         un.color[3] = 0.5f;
         wgpuQueueWriteBuffer(g.queue, g.ubuf, 0, &un, sizeof(un));
+        if (textured) {
+            Uniforms alphaUn = un;
+            alphaUn.p0[1] = 2.0f;
+            wgpuQueueWriteBuffer(g.queue, g.alphaUbuf, 0, &alphaUn, sizeof(alphaUn));
+        }
         const bool solid = pl.mode <= 3;
         const bool wire = pl.mode >= 2;
         WGPUSampler sampler = (pl.flags & 1u) ? g.sampNearest : g.sampLinear;
@@ -1302,6 +1347,18 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
                 wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
                 wgpuRenderPassEncoderDraw(pass, sub.vertexCount, 1, sub.firstVertex, 0);
                 wgpuBindGroupRelease(bg);
+            }
+            if (textured) {
+                wgpuRenderPassEncoderSetPipeline(pass, g.pTriAlpha);
+                for (const SubMesh& sub : mesh.subs) {
+                    if (!sub_visible(sub, pl.solo)) continue;
+                    WGPUBindGroup bg = make_bg(g.lTriAlpha,
+                        view_for(sub.texture, g.viewGray), sampler, g.alphaUbuf);
+                    if (bg == nullptr) continue;
+                    wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(pass, sub.vertexCount, 1, sub.firstVertex, 0);
+                    wgpuBindGroupRelease(bg);
+                }
             }
         }
         if (wire) {
@@ -1548,7 +1605,7 @@ void update_preview_input(ViewState& v) {
             }
         }
     }
-    if (g_hoverControl < 0 && pointerInPreview && v.layout != PreviewLayout::ThreeD &&
+    if (g_hoverControl < 0 && pointerInPreview && v.layout != PreviewLayout::TwoD &&
         v.shapeMenuOpen && shapeItemCount > 0) {
         const PickerMenuLayout layout = picker_menu_layout(
             static_cast<float>(clientWidth), static_cast<float>(clientHeight), shapeItemCount,
@@ -1598,6 +1655,14 @@ void update_preview_input(ViewState& v) {
             v.mode = g_hoverControl;
             v.textureMenuOpen = false;
             v.shapeMenuOpen = false;
+        } else if (g_hoverControl == kExportControl) {
+            v.textureMenuOpen = false;
+            v.shapeMenuOpen = false;
+            if (g_exportHandler != nullptr) {
+                g_exportHandler(v.solo);
+            } else {
+                logf(2, "GLB export handler is not available");
+            }
         } else if (g_hoverControl == kLayout2DControl) {
             set_preview_layout(PreviewLayout::TwoD);
         } else if (g_hoverControl == kLayout3DControl) {
@@ -1760,6 +1825,10 @@ void update_preview_input(ViewState& v) {
 }  // namespace
 
 bool preview_is_open() { return g_window != 0; }
+
+void preview_set_export_handler(PreviewExportHandler handler) {
+    g_exportHandler = handler;
+}
 
 void set_flying_camera(bool enabled) {
     ViewState& v = view();

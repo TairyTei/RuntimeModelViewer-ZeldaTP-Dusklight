@@ -1,7 +1,7 @@
 {
   "id": "com.malon.runtimeviewer",
   "name": "Runtime Model Viewer",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "author": "Malon",
   "description": "Tool to check models right in the game. Made with ai so may not work perfectly."
 }

@@ -1,6 +1,7 @@
 // Composition root: imports Dusklight services and wires the application modules together.
 #include "mods/service.hpp"
 #include "mods/svc/camera.h"
+#include "mods/svc/file.h"
 #include "mods/svc/gfx.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
@@ -8,6 +9,7 @@
 #include "mods/svc/window.h"
 
 #include "game/j3d_hook.hpp"
+#include "app/export_service.hpp"
 #include "gui/dusklight_ui.hpp"
 #include "preview/preview.hpp"
 #include "shared/common.hpp"
@@ -17,6 +19,7 @@ DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(WindowService, svc_window);
+IMPORT_SERVICE(FileService, svc_file);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
 IMPORT_SERVICE(HookService, svc_hook);
@@ -47,6 +50,7 @@ extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     mi::register_selector({"Screen center", mi::pick_screen_center});
+    mi::preview_set_export_handler(mi::request_glb_export);
 
     if (mi::j3d_install_hooks() != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "could not hook J3DModel::entry");
@@ -78,6 +82,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     if (g_frameHook != 0) svc_gfx->unregister_stage_hook(mod_ctx, g_frameHook);
     if (g_cameraHook != 0) svc_gfx->unregister_stage_hook(mod_ctx, g_cameraHook);
     g_frameHook = g_cameraHook = 0;
+    mi::preview_set_export_handler(nullptr);
     mi::ui_shutdown();
     mi::preview_shutdown();
     return MOD_OK;
