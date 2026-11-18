@@ -24,11 +24,16 @@ UiListHandle g_sceneList = 0, g_modelList = 0;
 UiElementHandle g_sceneInfo = 0, g_modelInfo = 0;
 uint64_t g_lastSceneRefresh = 0;
 uint64_t g_lastModelVersion = ~0ull;
+uint64_t g_lastModelKey = 0;
+size_t g_lastModelShapeCount = 0;
+size_t g_lastModelTextureCount = 0;
 
 std::vector<std::string> g_sceneLabels, g_modelLabels, g_pickLabels;
 
 constexpr uint64_t kShapeKey = 1000;
 constexpr uint64_t kTexKey = 2000;
+constexpr uint64_t kUdimKey = kTexKey - 1;
+constexpr int32_t kUdimTexture = -2;
 
 // ---------------------------------------------------------------------------------------------
 // small helpers
@@ -163,11 +168,14 @@ ModResult update_scene_tab(ModContext*, void*, ModError*) {
 void refresh_model_list() {
     const std::shared_ptr<const MeshData> mesh = current_mesh();
     g_lastModelVersion = mesh ? mesh->version : 0;
+    g_lastModelKey = mesh ? mesh->key : 0;
+    g_lastModelShapeCount = mesh ? mesh->subs.size() : 0;
+    g_lastModelTextureCount = mesh ? mesh->textures->size() : 0;
     if (g_modelList == 0) return;
     std::vector<uint64_t> keys;
     g_modelLabels.clear();
     if (mesh) {
-        g_modelLabels.reserve(2 + mesh->subs.size() + mesh->textures.size());
+        g_modelLabels.reserve(3 + mesh->subs.size() + mesh->textures->size());
         char buf[160];
         std::snprintf(buf, sizeof(buf), "%s  -  %u tris  (press: show all shapes)", mesh->title.c_str(), mesh->triCount);
         g_modelLabels.push_back(buf);
@@ -178,8 +186,10 @@ void refresh_model_list() {
             g_modelLabels.push_back(buf);
             keys.push_back(kShapeKey + s.shapeIndex);
         }
-        for (size_t i = 0; i < mesh->textures.size(); ++i) {
-            std::snprintf(buf, sizeof(buf), "   Texture %zu  %s", i, mesh->textures[i].desc.c_str());
+        g_modelLabels.push_back("   UDIM  all textures");
+        keys.push_back(kUdimKey);
+        for (size_t i = 0; i < mesh->textures->size(); ++i) {
+            std::snprintf(buf, sizeof(buf), "   Texture %zu  %s", i, (*mesh->textures)[i].desc.c_str());
             g_modelLabels.push_back(buf);
             keys.push_back(kTexKey + i);
         }
@@ -201,9 +211,9 @@ void refresh_model_list() {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
                 "%s<br/>joints %u, shapes %u, materials %u<br/>%u vertices, %u triangles<br/>%zu textures<br/><br/>"
-                "Press a shape to show it alone. Press a texture to see it behind the UV map (View tab, mode UV Map).",
+                "Press a shape to show it alone. Choose UDIM to view all textures together, or a texture to view it in the 2D layout.",
                 mesh->title.c_str(), mesh->joints, mesh->shapes, mesh->materials, mesh->vertexCount, mesh->triCount,
-                mesh->textures.size());
+                mesh->textures->size());
             rml = buf;
         }
         svc_ui->elem_set_rml(mod_ctx, g_modelInfo, rml.c_str());
@@ -214,8 +224,18 @@ void on_model_row(ModContext*, UiListHandle, uint64_t key, void*) {
     ViewState& v = view();
     if (key == 0) {
         v.solo = -1;
+    } else if (key == kUdimKey) {
+        v.uvTex = kUdimTexture;
+        set_preview_layout(PreviewLayout::TwoD);
+        v.textureMenuOpen = false;
+        set_flying_camera(false);
+        set_live_update(false);
     } else if (key >= kTexKey) {
         v.uvTex = static_cast<int>(key - kTexKey);
+        set_preview_layout(PreviewLayout::TwoD);
+        v.textureMenuOpen = false;
+        set_flying_camera(false);
+        set_live_update(false);
     } else if (key >= kShapeKey) {
         const int idx = static_cast<int>(key - kShapeKey);
         if (v.solo == idx) {
@@ -237,6 +257,7 @@ void on_model_row(ModContext*, UiListHandle, uint64_t key, void*) {
 bool model_row_selected(ModContext*, UiListHandle, uint64_t key, void*) {
     const ViewState& v = view();
     if (key == 0) return v.solo < 0;
+    if (key == kUdimKey) return v.uvTex == kUdimTexture;
     if (key >= kTexKey) return v.uvTex == static_cast<int>(key - kTexKey);
     return v.solo == static_cast<int>(key - kShapeKey);
 }
@@ -258,47 +279,79 @@ ModResult build_model_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiE
 }
 
 ModResult update_model_tab(ModContext*, void*, ModError*) {
-    if (g_modelList != 0 && mesh_version() != g_lastModelVersion) refresh_model_list();
+    if (g_modelList != 0 && mesh_version() != g_lastModelVersion) {
+        const std::shared_ptr<const MeshData> mesh = current_mesh();
+        if (mesh != nullptr && mesh->key == g_lastModelKey &&
+            mesh->subs.size() == g_lastModelShapeCount &&
+            mesh->textures->size() == g_lastModelTextureCount) {
+            g_lastModelVersion = mesh->version;
+        } else {
+            refresh_model_list();
+        }
+    }
     return MOD_OK;
 }
 
 // ---------------------------------------------------------------------------------------------
 // View tab
 // ---------------------------------------------------------------------------------------------
-const char* const kModes[] = {"Solid", "Textured", "Solid + Wire", "Textured + Wire", "Wire", "UV Map"};
+const char* const kModes[] = {"Solid", "Textured", "Solid + Wire", "Textured + Wire", "Wire"};
 const char* const kAxes[] = {"Y up", "Z up", "X up"};
 
-void get_mode(ModContext*, void*, UiControlValue* out) { out->int_value = view().mode; }
-void set_mode(ModContext*, void*, const UiControlValue* v) { view().mode = static_cast<int>(v->int_value); }
+void get_mode(ModContext*, void*, UiControlValue* out) {
+    out->int_value = view().mode;
+}
+void set_mode(ModContext*, void*, const UiControlValue* v) {
+    ViewState& state = view();
+    state.mode = std::clamp(static_cast<int>(v->int_value), 0, 4);
+    state.textureMenuOpen = false;
+    if (state.layout == PreviewLayout::TwoD) set_preview_layout(PreviewLayout::ThreeD);
+}
 void get_axis(ModContext*, void*, UiControlValue* out) { out->int_value = view().upAxis; }
 void set_axis(ModContext*, void*, const UiControlValue* v) {
     view().upAxis = std::clamp(static_cast<int>(v->int_value), 0, 2);
-}
-void get_flying_camera(ModContext*, void*, UiControlValue* out) {
-    out->bool_value = view().flyingCamera;
-}
-void set_flying_camera_control(ModContext*, void*, const UiControlValue* v) {
-    mi::set_flying_camera(v->bool_value);
 }
 void get_auto_rotate(ModContext*, void*, UiControlValue* out) {
     out->bool_value = view().autoRotate;
 }
 void set_auto_rotate(ModContext*, void*, const UiControlValue* v) {
-    if (!view().flyingCamera) view().autoRotate = v->bool_value;
+    if (!view().flyingCamera && view().layout != PreviewLayout::TwoD) view().autoRotate = v->bool_value;
+}
+void get_zoom(ModContext*, void*, UiControlValue* out) {
+    out->int_value = view().zoomPct;
+}
+void set_zoom(ModContext*, void*, const UiControlValue* v) {
+    ViewState& state = view();
+    const int zoom = std::clamp(static_cast<int>(v->int_value), 10, 800);
+    state.zoomPct = zoom;
+}
+void get_uv_zoom(ModContext*, void*, UiControlValue* out) {
+    out->int_value = view().uvZoomPct;
+}
+void set_uv_zoom(ModContext*, void*, const UiControlValue* v) {
+    view().uvZoomPct = std::clamp(static_cast<int>(v->int_value), 10, 800);
 }
 void on_toggle_preview(ModContext*, void*) {
     if (preview_is_open()) preview_close();
     else preview_open();
 }
+void on_layout_2d(ModContext*, void*) { set_preview_layout(PreviewLayout::TwoD); }
+void on_layout_3d(ModContext*, void*) { set_preview_layout(PreviewLayout::ThreeD); }
+void on_layout_both(ModContext*, void*) { set_preview_layout(PreviewLayout::Both); }
 
 ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
     ViewState& v = view();
     svc_ui->pane_add_section(mod_ctx, left, "Preview window");
     add_button(left, "Open / close preview window", on_toggle_preview);
+    svc_ui->pane_add_section(mod_ctx, left, "Layout");
+    add_button(left, "2D", on_layout_2d);
+    add_button(left, "3D", on_layout_3d);
+    add_button(left, "Both", on_layout_both);
 
+    svc_ui->pane_add_section(mod_ctx, left, "3D settings");
     UiControlDesc m = UI_CONTROL_DESC_INIT;
     m.kind = UI_CONTROL_DROPDOWN;
-    m.label = "Display mode";
+    m.label = "3D display mode";
     m.get = get_mode;
     m.set = set_mode;
     m.options = kModes;
@@ -314,12 +367,6 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
     axis.option_count = sizeof(kAxes) / sizeof(kAxes[0]);
     svc_ui->pane_add_control(mod_ctx, left, &axis, nullptr);
 
-    UiControlDesc fly = UI_CONTROL_DESC_INIT;
-    fly.kind = UI_CONTROL_TOGGLE;
-    fly.label = "Flying camera";
-    fly.get = get_flying_camera;
-    fly.set = set_flying_camera_control;
-    svc_ui->pane_add_control(mod_ctx, left, &fly, nullptr);
     UiControlDesc rotate = UI_CONTROL_DESC_INIT;
     rotate.kind = UI_CONTROL_TOGGLE;
     rotate.label = "Auto-rotate";
@@ -328,13 +375,17 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
     svc_ui->pane_add_control(mod_ctx, left, &rotate, nullptr);
     add_number(left, "Yaw", get_yaw, set_yaw, nullptr, 0, 359, 10, " deg");
     add_number(left, "Pitch", get_int, set_int, &v.pitch, -89, 89, 5, " deg");
-    add_number(left, "Zoom", get_int, set_int, &v.zoomPct, 10, 800, 10, " %");
+    add_number(left, "3D zoom", get_zoom, set_zoom, nullptr, 10, 800, 10, " %");
     add_toggle(left, "Nearest texture filtering", &v.nearest);
+    svc_ui->pane_add_section(mod_ctx, left, "2D settings");
+    add_number(left, "UV zoom", get_uv_zoom, set_uv_zoom, nullptr, 10, 800, 10, " %");
 
     svc_ui->pane_add_rml(mod_ctx, right,
-        "Modes 0-4 show the 3D model, UV Map shows the unwrap of the selected shapes over a texture.<br/><br/>"
-        "Preview toolbar: click a mode, choose an axis, toggle flying camera, or open the texture list "
-        "(choosing a texture switches to UV Map). "
+        "Use the preview toolbar to choose 2D, 3D, or Both. Both splits the preview into equal 3D and UV panes. "
+        "Choose UDIM in the UV texture picker to arrange all model textures on their UV tiles. "
+        "3D display modes are Solid, Textured, Solid + Wire, Textured + Wire, and Wire. "
+        "Flying camera and live-pose controls are shown only in 3D; the UV pane has its own pan, zoom, and texture picker. "
+        "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance. "
         "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "
         "In flying mode, WASD moves, Q/E moves vertically, Shift speeds up, and mouse-drag looks around. "
         "Auto-rotate stops when you adjust the camera.", nullptr);

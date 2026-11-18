@@ -82,6 +82,9 @@ void select_model(uint64_t key) {
     g_view.uvTex = -1;
     g_view.texturePage = 0;
     g_view.textureMenuOpen = false;
+    g_view.uvPanX = 0.0f;
+    g_view.uvPanY = 0.0f;
+    g_view.uvZoomPct = 100;
 }
 
 uint64_t selected_key() {

@@ -1,6 +1,7 @@
 #pragma once
 // Plain-C++ snapshot of one J3D model. No game types in here.
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -27,7 +28,9 @@ struct MeshData {
     // 6 floats per vertex: pos.xyz, uv.xy, shape id
     std::vector<float> vertices;
     std::vector<SubMesh> subs;
-    std::vector<TexImage> textures;
+    std::shared_ptr<const std::vector<TexImage>> textures =
+        std::make_shared<const std::vector<TexImage>>();
+    uint64_t dataKey = 0;
     float bmin[3] = {0, 0, 0};
     float bmax[3] = {0, 0, 0};
     uint32_t joints = 0, shapes = 0, materials = 0, vertexCount = 0, triCount = 0;

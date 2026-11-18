@@ -213,7 +213,13 @@ float model_radius(J3DModelData* md) {
 }
 
 // ---------- snapshot ----------
-bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
+template <typename... Args>
+void snapshot_log(bool verbose, int level, const char* format, Args... args) {
+    if (verbose) logf(level, format, args...);
+}
+
+bool snapshot_model(J3DModel* model, MeshData& out, std::string& err,
+    const MeshData* previous, bool verbose) {
     J3DModelData* md = model->getModelData();
     if (md == nullptr) {
         err = "model has no model data";
@@ -224,7 +230,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     const uint8_t* sourcePosArr = reinterpret_cast<const uint8_t*>(vd.getVtxPosArray());
     void* currentPos = model->getVertexBuffer()->getCurrentVtxPos();
     const bool cpuSkinPos = model->checkFlag(J3DMdlFlag_SkinPosCpu);
-    logf(0,
+    snapshot_log(verbose, 0,
         "snapshot begin: model=%p data=%p shapes=%u joints=%u materials=%u verts=%u "
         "fastSkin=%u skinDeform=%p cpuSkinPos=%u sourcePos=%p currentPos=%p",
         static_cast<void*>(model), static_cast<void*>(md), static_cast<unsigned>(shapeNum),
@@ -235,13 +241,16 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     M34 modelBaseInverse{};
     const bool hasModelBaseInverse = inverse_affine(model->getBaseTRMtx(), modelBaseInverse);
     Mtx& modelBase = model->getBaseTRMtx();
-    logf(0, "model base: invertible=%u translation=(%.3f,%.3f,%.3f)",
+    snapshot_log(verbose, 0, "model base: invertible=%u translation=(%.3f,%.3f,%.3f)",
         hasModelBaseInverse ? 1u : 0u, modelBase[0][3], modelBase[1][3], modelBase[2][3]);
 
-    // ---- textures (decode all; shapes refer to them by index) ----
-    // ---- textures ----
     J3DTexture* texTable = md->getTexture();
-        const uint32_t texCount = texTable != nullptr ? texTable->getNum() : 0;
+    const uint32_t texCount = texTable != nullptr ? texTable->getNum() : 0;
+    if (previous != nullptr && previous->textures != nullptr &&
+        previous->textures->size() == texCount) {
+        out.textures = previous->textures;
+    } else {
+        auto textureImages = std::make_shared<std::vector<TexImage>>();
         for (uint32_t i = 0; i < texCount; ++i) {
             TexImage ti;
             const ResTIMG* res = texTable->getResTIMG(static_cast<uint16_t>(i));
@@ -274,10 +283,10 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                 ti.w = w;
                 ti.h = h;
             } else {
-                logf(1, "texture %u not decoded: format=%u size=%ux%u offsets image=%d palette=%d",
+                snapshot_log(verbose, 1, "texture %u not decoded: format=%u size=%ux%u offsets image=%d palette=%d",
                     i, fmt, w, h, imgOff, palOff);
             }
-            logf(0,
+            snapshot_log(verbose, 0,
                 "texture %u import: decoded=%u format=%u size=%ux%u imageOffset=%d paletteOffset=%d "
                 "paletteFmt=%u colors=%u rgbaBytes=%zu runtimeImage=%u dataBase=%p image=%p palette=%p",
                 i, decoded ? 1u : 0u, static_cast<unsigned>(fmt), w, h, imgOff, palOff,
@@ -288,8 +297,10 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
             char d[64];
             std::snprintf(d, sizeof(d), "%ux%u %s", w, h, gc_format_name(fmt));
             ti.desc = d;
-            out.textures.push_back(std::move(ti));
+            textureImages->push_back(std::move(ti));
         }
+        out.textures = std::move(textureImages);
+    }
 
     // ---- vertex arrays ----
     const uint8_t* posArr = sourcePosArr;
@@ -323,7 +334,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                 fmts[a].frac = f_frac(list[i]);
             }
         }
-        logf(0, "fmts: pos found=%d cnt=%d type=%d frac=%d, uv found=%d",
+        snapshot_log(verbose, 0, "fmts: pos found=%d cnt=%d type=%d frac=%d, uv found=%d",
              fmts[9].found, fmts[9].cnt, fmts[9].type, fmts[9].frac, fmts[13].found);
     }
     const uint8_t* uvArr[8] = {};
@@ -341,13 +352,13 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         uvStrides[i] = array_stride(vd, 13 + i, 2 * comp_bytes(uvFmts[i].type));
         uvCounts[i] = uvArr[i] != nullptr ? array_count(vd, 13 + i, vtxNum) : 0;
     }
-    logf(0,
+    snapshot_log(verbose, 0,
         "vertex arrays: posType=%d frac=%d count=%u stride=%u current=%p usingCurrent=%u cpuDeformed=%u",
         posType, posFrac, posCount, posStride, static_cast<const void*>(posArr),
         posArr != sourcePosArr ? 1u : 0u, positionsDeformed ? 1u : 0u);
     for (int i = 0; i < 8; ++i) {
         if (uvArr[i] != nullptr) {
-            logf(0, "TEX%u array=%p count=%u stride=%u type=%d frac=%d components=%d",
+            snapshot_log(verbose, 0, "TEX%u array=%p count=%u stride=%u type=%d frac=%d components=%d",
                 static_cast<unsigned>(i), static_cast<const void*>(uvArr[i]), uvCounts[i],
                 uvStrides[i], uvFmts[i].type, uvFmts[i].frac, uvFmts[i].cnt);
         }
@@ -391,7 +402,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         std::string lerr;
         if (!build_vertex_layout(descs, [&](int a) { return (a >= 0 && a < 32) ? fmts[a] : AttrFmt{}; },
                 layout, lerr)) {
-            logf(1, "shape %u skipped: %s", si, lerr.c_str());
+            snapshot_log(verbose, 1, "shape %u skipped: %s", si, lerr.c_str());
             continue;
         }
 
@@ -399,7 +410,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         for (const AttrDesc& d : descs) {
             dbg += std::to_string(d.attr) + ":" + std::to_string(d.type) + " ";
         }
-        logf(0, "shape %u: stride=%u | posOff=%d posBytes=%d | pnmDesc=%u originalPnm=%u | descs: %s",
+        snapshot_log(verbose, 0, "shape %u: stride=%u | posOff=%d posBytes=%d | pnmDesc=%u originalPnm=%u | descs: %s",
              static_cast<unsigned>(si), layout.stride, layout.posOff, layout.posBytes,
              hasPnmtxDesc ? 1u : 0u, originalPnm ? 1u : 0u, dbg.c_str());
 
@@ -444,7 +455,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                     if (source < GX_TG_TEX0 || source > GX_TG_TEX7) continue;
                     const int sourceIndex = source - GX_TG_TEX0;
                     if (uvArr[sourceIndex] == nullptr) {
-                        logf(1, "shape %u material texture uses missing TEX%u array",
+                        snapshot_log(verbose, 1, "shape %u material texture uses missing TEX%u array",
                             si, static_cast<unsigned>(sourceIndex));
                         continue;
                     }
@@ -471,7 +482,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                             }
                             applyUvMatrix = finite;
                             if (!finite) {
-                                logf(1, "shape %u has a non-finite texture matrix; using raw UVs", si);
+                                snapshot_log(verbose, 1, "shape %u has a non-finite texture matrix; using raw UVs", si);
                             }
                         }
                     }
@@ -484,18 +495,18 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                 }
             }
         }
-        logf(0,
+        snapshot_log(verbose, 0,
             "shape %u material map: material=%d label=%s texture=%d tevStage=%d texMap=%d "
             "texCoord=%d source=%d uvArray=%p texMtxReg=%d matrixApplied=%u",
             static_cast<unsigned>(si), materialIndex, sub.label.empty() ? "-" : sub.label.c_str(),
             sub.texture, selectedTevStage, selectedTexMap, selectedTexCoord, selectedTexSource,
             static_cast<const void*>(uvArr[uvSource]), selectedTexMtxReg, applyUvMatrix ? 1u : 0u);
         if (applyUvMatrix) {
-            logf(0, "shape %u UV matrix: [%g %g %g %g] [%g %g %g %g]",
+            snapshot_log(verbose, 0, "shape %u UV matrix: [%g %g %g %g] [%g %g %g %g]",
                 static_cast<unsigned>(si), uvMatrix[0][0], uvMatrix[0][1], uvMatrix[0][2],
                 uvMatrix[0][3], uvMatrix[1][0], uvMatrix[1][1], uvMatrix[1][2], uvMatrix[1][3]);
         }
-        logf(0, "parsing shape %u...", si);
+        snapshot_log(verbose, 0, "parsing shape %u...", si);
         const uint16_t groups = shape->getMtxGroupNum();
         M34 slots[10] = {};
         for (uint16_t g = 0; g < groups; ++g) {
@@ -535,7 +546,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                         worldMatrix.valid = false;
                         slots[s] = worldMatrix;
                     }
-                    logf(0,
+                    snapshot_log(verbose, 0,
                         "shape %u group %u matrix slot %u: draw=%u matrix=%u weighted=%u valid=%u "
                         "worldTranslation=(%.3f,%.3f,%.3f) localTranslation=(%.3f,%.3f,%.3f)",
                         static_cast<unsigned>(si), static_cast<unsigned>(g), static_cast<unsigned>(s),
@@ -545,7 +556,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                         slots[s].m[0][3], slots[s].m[1][3], slots[s].m[2][3]);
                 }
             }
-            logf(0, "shape %u group %u matrix state: inherited=%u unresolved=%u",
+            snapshot_log(verbose, 0, "shape %u group %u matrix state: inherited=%u unresolved=%u",
                 static_cast<unsigned>(si), static_cast<unsigned>(g),
                 inheritedMatrixSlots, unresolvedMatrixSlots);
 
@@ -557,18 +568,18 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
             const uint8_t* dl_ptr = dl_data(draw);
             uint32_t dl_len = dl_size(draw);
             if (dl_len > 1024 * 1024) dl_len = 1024 * 1024; // Защита от чтения гигабайтов
-            logf(0, "shape %u group %u draw: ptr=%p len=%u groups=%u usedMatrices=%u cpuSkinPos=%u",
+            snapshot_log(verbose, 0, "shape %u group %u draw: ptr=%p len=%u groups=%u usedMatrices=%u cpuSkinPos=%u",
                 static_cast<unsigned>(si), static_cast<unsigned>(g), static_cast<const void*>(dl_ptr),
                 dl_len, static_cast<unsigned>(groups),
                 smtx != nullptr ? static_cast<unsigned>(smtx->getUseMtxNum()) : 0u,
                 positionsDeformed ? 1u : 0u);
             if (dl_ptr != nullptr && dl_len > 0) {
                 if (dl_len >= 8) {
-                    logf(0, "DL prefix: %02X %02X %02X %02X %02X %02X %02X %02X",
+                    snapshot_log(verbose, 0, "DL prefix: %02X %02X %02X %02X %02X %02X %02X %02X",
                         dl_ptr[0], dl_ptr[1], dl_ptr[2], dl_ptr[3],
                         dl_ptr[4], dl_ptr[5], dl_ptr[6], dl_ptr[7]);
                 } else {
-                    logf(0, "DL prefix: only %u byte(s) available", dl_len);
+                    snapshot_log(verbose, 0, "DL prefix: only %u byte(s) available", dl_len);
                 }
 
                 VertexLayout drawLayout = layout;
@@ -603,14 +614,14 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                             parsed = true;
                             fastSkinFallbackUsed = true;
                             perr.clear();
-                            logf(1, "shape %u: restored PNMTXIDX byte for fast-skin display list", si);
+                            snapshot_log(verbose, 1, "shape %u: restored PNMTXIDX byte for fast-skin display list", si);
                         } else {
-                            logf(1, "shape %u: fast-skin layout fallback rejected: pnmValid=%u matrixSlots=%u error=%s",
+                            snapshot_log(verbose, 1, "shape %u: fast-skin layout fallback rejected: pnmValid=%u matrixSlots=%u error=%s",
                                 si, fallbackPnmValid ? 1u : 0u, static_cast<unsigned>(matrixSlots),
                                 fallbackErr.c_str());
                         }
                     } else {
-                        logf(1, "shape %u: fast-skin layout fallback failed: %s",
+                        snapshot_log(verbose, 1, "shape %u: fast-skin layout fallback failed: %s",
                             si, drawLayoutErr.c_str());
                     }
                 }
@@ -656,7 +667,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                     pnmtxSummary += std::to_string(slot) + ":" + std::to_string(pnmtxCounts[slot]) + " ";
                 }
             }
-            logf(0,
+            snapshot_log(verbose, 0,
                 "shape %u group %u parse: ok=%u triangles=%zu fastSkinCandidate=%u fallbackUsed=%u "
                 "posRefsInvalid=%u posRange=%d..%d uvRefsMissing=%u uvRefsInvalid=%u uvRange=%d..%d "
                 "pnmtxMissing=%u pnmtxUnresolved=%u pnmtxSlots=[%s] error=%s",
@@ -670,7 +681,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
             }
 
             if (tris.size() > 100000) {
-                logf(1, "Too many triangles in one draw call (%zu), parsing likely failed!", tris.size());
+                snapshot_log(verbose, 1, "Too many triangles in one draw call (%zu), parsing likely failed!", tris.size());
                 tris.resize(100000); // Обрезаем, чтобы не зависнуть
             }
             for (size_t t = 0; t + 2 < tris.size(); t += 3) {
@@ -757,11 +768,11 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         if (sub.vertexCount > 0) out.subs.push_back(std::move(sub));
     }
 
-    if (!dlErr.empty()) logf(1, "display list problem: %s", dlErr.c_str());
-    if (badIndex > 0) logf(1, "%u vertex indices were out of range (wrong array layout?)", badIndex);
+    if (!dlErr.empty()) snapshot_log(verbose, 1, "display list problem: %s", dlErr.c_str());
+    if (badIndex > 0) snapshot_log(verbose, 1, "%u vertex indices were out of range (wrong array layout?)", badIndex);
     if (out.vertices.empty()) {
         err = dlErr.empty() ? "no triangles found" : dlErr;
-        logf(1, "snapshot failed: model=%p error=%s", static_cast<void*>(model), err.c_str());
+        snapshot_log(verbose, 1, "snapshot failed: model=%p error=%s", static_cast<void*>(model), err.c_str());
         return false;
     }
     for (int i = 0; i < 3; ++i) {
@@ -775,14 +786,14 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     out.vertexCount = static_cast<uint32_t>(out.vertices.size() / 6);
     out.triCount = out.vertexCount / 3;
     uint32_t decodedTextures = 0;
-    for (const TexImage& texture : out.textures) {
+    for (const TexImage& texture : *out.textures) {
         if (texture.w != 0 && texture.h != 0 && !texture.rgba.empty()) ++decodedTextures;
     }
-    logf(0,
+    snapshot_log(verbose, 0,
         "snapshot complete: model=%p vertices=%u triangles=%u submeshes=%zu textures=%zu "
         "decodedTextures=%u badTriangles=%u bounds=[(%g,%g,%g)-(%g,%g,%g)]",
         static_cast<void*>(model), out.vertexCount, out.triCount, out.subs.size(),
-        out.textures.size(), decodedTextures, badIndex,
+        out.textures->size(), decodedTextures, badIndex,
         out.bmin[0], out.bmin[1], out.bmin[2], out.bmax[0], out.bmax[1], out.bmax[2]);
     return true;
 }
@@ -810,8 +821,14 @@ HookAction on_model_entry(ModContext*, void* args, void*, void*) {
     // logf(0, "hook entry: key=%llx", (unsigned long long)info.key);
 
     if (take_pending(info.key)) {
+        static uint64_t lastLiveFailureKey = 0;
         auto mesh = std::make_shared<MeshData>();
         mesh->key = info.key;
+        mesh->dataKey = info.dataKey;
+        const std::shared_ptr<const MeshData> previous = current_mesh();
+        const bool sameData = previous != nullptr && previous->key == info.key &&
+            previous->dataKey == info.dataKey;
+        const bool verbose = !view().liveUpdate || !sameData;
         char title[96];
         std::snprintf(title, sizeof(title), "model %06llx (data %06llx)",
             static_cast<unsigned long long>(info.key & 0xFFFFFF),
@@ -819,14 +836,20 @@ HookAction on_model_entry(ModContext*, void* args, void*, void*) {
         mesh->title = title;
         std::string err;
 
-        logf(0, "snapshot starting for %llx", (unsigned long long)info.key);
+        if (verbose) logf(0, "snapshot starting for %llx", (unsigned long long)info.key);
 
-        if (snapshot_model(model, *mesh, err)) {
-            logf(0, "snapshot %s: %u tris, %zu shapes, %zu textures", title, mesh->triCount,
-                mesh->subs.size(), mesh->textures.size());
+        if (snapshot_model(model, *mesh, err, sameData ? previous.get() : nullptr, verbose)) {
+            if (verbose) {
+                logf(0, "snapshot %s: %u tris, %zu shapes, %zu textures", title, mesh->triCount,
+                    mesh->subs.size(), mesh->textures->size());
+            }
+            if (lastLiveFailureKey == info.key) lastLiveFailureKey = 0;
             publish_mesh(std::move(mesh));
         } else {
-            logf(2, "snapshot of %s failed: %s", title, err.c_str());
+            if (verbose || lastLiveFailureKey != info.key) {
+                logf(2, "snapshot of %s failed: %s", title, err.c_str());
+            }
+            lastLiveFailureKey = info.key;
         }
     }
     return HOOK_CONTINUE;
