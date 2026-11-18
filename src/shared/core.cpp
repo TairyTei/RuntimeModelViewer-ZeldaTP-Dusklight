@@ -1,10 +1,10 @@
-#include "core.hpp"
+#include "shared/core.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <map>
 
-#include "common.hpp"
+#include "shared/common.hpp"
 
 namespace mi {
 namespace {
@@ -165,18 +165,6 @@ bool pick_screen_center(const PickContext& ctx, uint64_t* outKey) {
         }
     }
     return found;
-}
-
-bool run_selector(size_t index) {
-    if (index >= g_selectors.size()) return false;
-    const std::vector<ModelInfo> models = registry_snapshot();
-    PickContext ctx;
-    ctx.cam = camera();
-    ctx.models = &models;
-    uint64_t key = 0;
-    if (!g_selectors[index].pick(ctx, &key)) return false;
-    inspect_model(key);
-    return true;
 }
 
 }  // namespace mi

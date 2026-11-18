@@ -3,16 +3,17 @@
 //   Model  - tree of the selected model: model -> shapes -> textures. Press a shape to show it
 //            alone (and show its texture behind the UV map); press a texture to view it in UV mode.
 //   View   - display mode, rotation, zoom, filtering.
-#include "ui.hpp"
+#include "gui/dusklight_ui.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
 
-#include "common.hpp"
-#include "core.hpp"
-#include "preview.hpp"
+#include "app/inspector_service.hpp"
+#include "preview/preview.hpp"
+#include "shared/common.hpp"
+#include "shared/core.hpp"
 #include "mods/svc/ui.h"
 
 namespace mi {

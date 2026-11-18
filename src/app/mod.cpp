@@ -1,5 +1,4 @@
-// Model Inspector - Dusklight mod entry point. Imports the services; everything else lives in
-// the other files (core: state, j3d: game access, preview: window + renderer, ui: menus).
+// Composition root: imports Dusklight services and wires the application modules together.
 #include "mods/service.hpp"
 #include "mods/svc/camera.h"
 #include "mods/svc/gfx.h"
@@ -8,11 +7,11 @@
 #include "mods/svc/ui.h"
 #include "mods/svc/window.h"
 
-#include "common.hpp"
-#include "core.hpp"
-#include "j3d.hpp"
-#include "preview.hpp"
-#include "ui.hpp"
+#include "game/j3d_hook.hpp"
+#include "gui/dusklight_ui.hpp"
+#include "preview/preview.hpp"
+#include "shared/common.hpp"
+#include "shared/core.hpp"
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);

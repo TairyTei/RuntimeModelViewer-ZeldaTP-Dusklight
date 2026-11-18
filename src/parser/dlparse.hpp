@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace mi {
+namespace mi::parser {
 
 // GX numbers used here: attr  PNMTXIDX=0 TEX0MTXIDX..TEX7MTXIDX=1..8 POS=9 NRM=10 CLR0=11 CLR1=12
 //                             TEX0..TEX7=13..20 NBT=25 NULL=0xFF
@@ -50,4 +50,4 @@ bool build_vertex_layout(const std::vector<AttrDesc>& descs,
 bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layout,
     std::vector<VertexRef>& tris, std::string& err, int depth = 0);
 
-}  // namespace mi
+}  // namespace mi::parser

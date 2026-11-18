@@ -1,11 +1,10 @@
-#include "dlparse.hpp"
-#include "common.hpp"
+#include "parser/dlparse.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 
-namespace mi {
+namespace mi::parser {
 namespace {
 
 inline uint32_t be32(const uint8_t* p) {
@@ -177,11 +176,6 @@ bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layo
             const int prim = dl[p + 2] & 0xF8;
             const uint32_t vertexCount = be16(dl + p + 3);
             const uint32_t indexCount = be32(dl + p + 5);
-            logf(0,
-                "Aurora DRAW_INDEXED: primitive=0x%02X vertices=%u indices=%u vertexStride=%u "
-                "indexOffset=%zu vertexOffset=%zu",
-                prim, vertexCount, indexCount, layout.stride, p + 9,
-                p + 9 + static_cast<size_t>(indexCount) * sizeof(uint16_t));
             if (prim != 0x90 || indexCount % 3 != 0) {
                 err = "invalid Aurora indexed triangle command";
                 return false;
@@ -231,10 +225,6 @@ bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layo
             for (uint32_t i = 0; i < n; ++i) {
                 const uint8_t* r = dl + p + static_cast<size_t>(i) * layout.stride;
                 const VertexRef ref = read_vertex_ref(r, layout);
-                if (i < 3) {
-                    logf(0, "  vert %u: posIdx=%d uv0Idx=%d pnmtx=%d",
-                        i, ref.posIdx, ref.uvIdx[0], ref.pnmtx);
-                }
                 v.push_back(ref);
             }
             p += static_cast<size_t>(n) * layout.stride;
@@ -258,4 +248,4 @@ bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layo
     return true;
 }
 
-}  // namespace mi
+}  // namespace mi::parser

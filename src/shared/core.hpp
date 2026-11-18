@@ -1,26 +1,15 @@
 #pragma once
-// Shared state of the inspector: which models are on screen, which one is selected, the latest
-// mesh snapshot and the preview view settings. No game types and no GPU types in here.
+// Shared model registry, snapshots, and view state. No game, GUI, or GPU types in this layer.
 //
-// EXTENDING SELECTION: every way of choosing a model ends in mi::inspect_model(key). To add a new
-// method (cursor ray, lock-on target, ...) fill in a mi::Selector and call mi::register_selector()
-// from mod_initialize; the UI adds a "Pick: <label>" button for it automatically.
+// EXTENDING SELECTION: add a mi::Selector and register it from mod_initialize; the application
+// service handles the resulting selection and opens the preview.
 #include <cstdint>
 #include <memory>
 #include <vector>
 
-#include "mesh.hpp"
+#include "shared/mesh.hpp"
 
 namespace mi {
-
-struct ModelInfo {
-    uint64_t key = 0;      // J3DModel* (only ever compared, never dereferenced outside the hook)
-    uint64_t dataKey = 0;  // J3DModelData*
-    float pos[3] = {0, 0, 0};
-    float radius = 0;
-    uint32_t joints = 0, shapes = 0, materials = 0, verts = 0;
-    uint64_t lastFrame = 0;
-};
 
 struct CameraSnap {
     bool valid = false;
@@ -76,7 +65,6 @@ void registry_note(const ModelInfo& info);  // called by the J3D hook for every 
 std::vector<ModelInfo> registry_snapshot();  // sorted nearest-first, stale entries dropped
 
 // ---- selection ----
-void inspect_model(uint64_t key);  // select + open the preview window (defined in preview.cpp)
 void select_model(uint64_t key);   // select only
 uint64_t selected_key();
 void request_refresh();            // re-snapshot the selected model (current pose)
@@ -96,7 +84,4 @@ CameraSnap camera();
 void register_selector(const Selector& s);
 const std::vector<Selector>& selectors();
 bool pick_screen_center(const PickContext& ctx, uint64_t* outKey);
-// Runs selector `index` against the current registry; calls inspect_model on success.
-bool run_selector(size_t index);
-
 }  // namespace mi

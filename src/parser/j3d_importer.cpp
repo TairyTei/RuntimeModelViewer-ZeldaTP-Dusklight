@@ -1,6 +1,5 @@
-// The ONLY file that touches game (J3D) types. If the port's headers differ from what this was
-// written against, the compile errors will all be in here, mostly in the small accessor templates
-// at the top.
+// Translates live J3D model data into shared snapshots. Game lifecycle and hook registration live
+// in game/j3d_hook.cpp; parser algorithms are isolated in the other parser sources.
 // Include order matters: the game's global.h redefines nullptr, which breaks standard library
 // headers included after it. So: standard headers and our own headers first, game headers after.
 #include <algorithm>
@@ -20,14 +19,11 @@
 #include <utility>
 #include <vector>
 
-#include "mods/svc/hook.h"
-#include "mods/svc/hook.hpp"
-
-#include "common.hpp"
-#include "core.hpp"
-#include "dlparse.hpp"
-#include "gctex.hpp"
-#include "j3d.hpp"
+#include "shared/common.hpp"
+#include "shared/mesh.hpp"
+#include "parser/dlparse.hpp"
+#include "parser/gctex.hpp"
+#include "parser/j3d_importer.hpp"
 
 #include "global.h"
 
@@ -39,9 +35,7 @@
 #include "JSystem/J3DGraphBase/J3DTexture.h"
 #include "JSystem/J3DGraphBase/J3DVertex.h"
 
-DEFINE_HOOK(&J3DModel::entry, J3DModelEntryHook);
-
-namespace mi {
+namespace mi::parser {
 namespace {
 
 // ---------- field accessors (tolerate either naming style of the GX list structs) ----------
@@ -798,13 +792,13 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err,
     return true;
 }
 
-HookAction on_model_entry(ModContext*, void* args, void*, void*) {
-    J3DModel* model = mods::arg<J3DModel*>(args, 0);
-    if (model == nullptr) return HOOK_CONTINUE;
-    J3DModelData* md = model->getModelData();
-    if (md == nullptr) return HOOK_CONTINUE;
+}  // namespace
 
-    ModelInfo info;
+ModelInfo describe_j3d_model(::J3DModel* model) {
+    ModelInfo info{};
+    if (model == nullptr) return info;
+    J3DModelData* md = model->getModelData();
+    if (md == nullptr) return info;
     info.key = reinterpret_cast<uintptr_t>(model);
     info.dataKey = reinterpret_cast<uintptr_t>(md);
     Mtx& base = model->getBaseTRMtx();
@@ -816,49 +810,12 @@ HookAction on_model_entry(ModContext*, void* args, void*, void*) {
     info.shapes = md->getShapeNum();
     info.materials = md->getMaterialNum();
     info.verts = md->getVtxNum();
-    registry_note(info);
-
-    // logf(0, "hook entry: key=%llx", (unsigned long long)info.key);
-
-    if (take_pending(info.key)) {
-        static uint64_t lastLiveFailureKey = 0;
-        auto mesh = std::make_shared<MeshData>();
-        mesh->key = info.key;
-        mesh->dataKey = info.dataKey;
-        const std::shared_ptr<const MeshData> previous = current_mesh();
-        const bool sameData = previous != nullptr && previous->key == info.key &&
-            previous->dataKey == info.dataKey;
-        const bool verbose = !view().liveUpdate || !sameData;
-        char title[96];
-        std::snprintf(title, sizeof(title), "model %06llx (data %06llx)",
-            static_cast<unsigned long long>(info.key & 0xFFFFFF),
-            static_cast<unsigned long long>(info.dataKey & 0xFFFFFF));
-        mesh->title = title;
-        std::string err;
-
-        if (verbose) logf(0, "snapshot starting for %llx", (unsigned long long)info.key);
-
-        if (snapshot_model(model, *mesh, err, sameData ? previous.get() : nullptr, verbose)) {
-            if (verbose) {
-                logf(0, "snapshot %s: %u tris, %zu shapes, %zu textures", title, mesh->triCount,
-                    mesh->subs.size(), mesh->textures->size());
-            }
-            if (lastLiveFailureKey == info.key) lastLiveFailureKey = 0;
-            publish_mesh(std::move(mesh));
-        } else {
-            if (verbose || lastLiveFailureKey != info.key) {
-                logf(2, "snapshot of %s failed: %s", title, err.c_str());
-            }
-            lastLiveFailureKey = info.key;
-        }
-    }
-    return HOOK_CONTINUE;
+    return info;
 }
 
-}  // namespace
-
-ModResult j3d_install_hooks() {
-    return mods::hook::add_pre<J3DModelEntryHook>(on_model_entry);
+bool snapshot_j3d_model(::J3DModel* model, MeshData& out, std::string& err,
+    const MeshData* previous, bool verbose) {
+    return snapshot_model(model, out, err, previous, verbose);
 }
 
-}  // namespace mi
+}  // namespace mi::parser

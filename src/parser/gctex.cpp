@@ -1,8 +1,8 @@
-#include "gctex.hpp"
+#include "parser/gctex.hpp"
 
 #include <cstring>
 
-namespace mi {
+namespace mi::parser {
 namespace {
 
 inline uint16_t be16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
@@ -225,4 +225,4 @@ const char* gc_format_name(uint8_t fmt) {
     }
 }
 
-}  // namespace mi
+}  // namespace mi::parser

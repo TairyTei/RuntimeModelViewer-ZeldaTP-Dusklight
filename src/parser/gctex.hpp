@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace mi {
+namespace mi::parser {
 
 // Decodes the base level of a GameCube texture (tiled, big-endian) into RGBA8.
 // fmt: GXTexFmt (I4=0 I8=1 IA4=2 IA8=3 RGB565=4 RGB5A3=5 RGBA8=6 C4=8 C8=9 C14X2=10 CMPR=14).
@@ -12,4 +12,4 @@ bool decode_gc_texture(const uint8_t* img, uint32_t w, uint32_t h, uint8_t fmt,
 
 const char* gc_format_name(uint8_t fmt);
 
-}  // namespace mi
+}  // namespace mi::parser

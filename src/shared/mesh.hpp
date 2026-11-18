@@ -7,6 +7,15 @@
 
 namespace mi {
 
+struct ModelInfo {
+    uint64_t key = 0;
+    uint64_t dataKey = 0;
+    float pos[3] = {0, 0, 0};
+    float radius = 0;
+    uint32_t joints = 0, shapes = 0, materials = 0, verts = 0;
+    uint64_t lastFrame = 0;
+};
+
 struct TexImage {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> rgba;  // w * h * 4, row 0 = top

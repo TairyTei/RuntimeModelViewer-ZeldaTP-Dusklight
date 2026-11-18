@@ -1,7 +1,7 @@
 {
-  "id": "com.example.my_mod",
-  "name": "My Mod",
-  "version": "@PROJECT_VERSION@",
-  "author": "You",
-  "description": "An example Dusklight mod"
+  "id": "com.malon.runtimeviewer",
+  "name": "Runtime Model Viewer",
+  "version": "0.1.0",
+  "author": "Malon",
+  "description": "Tool to check models right in the game. Made with ai so may not work perfectly."
 }

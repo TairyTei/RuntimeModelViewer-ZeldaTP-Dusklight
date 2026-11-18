@@ -1,7 +1,7 @@
 // Preview window: an auxiliary native window (WindowService) with our own WebGPU renderer
 // (GfxService present target). Rendering code runs on the render worker thread; everything it
 // needs arrives in a small payload or via the mutex-protected snapshot in core.cpp.
-#include "preview.hpp"
+#include "preview/preview.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,9 +11,9 @@
 #include <cstring>
 #include <vector>
 
-#include "common.hpp"
-#include "core.hpp"
-#include "math.hpp"
+#include "preview/math.hpp"
+#include "shared/common.hpp"
+#include "shared/core.hpp"
 #include "mods/svc/gfx.h"
 #include "mods/svc/window.h"
 #include <webgpu/webgpu.h>
@@ -1742,11 +1742,6 @@ ModResult preview_update(ModError* error) {
 void preview_shutdown() {
     preview_close();
     release_all_gpu();
-}
-
-void inspect_model(uint64_t key) {
-    select_model(key);
-    preview_open();
 }
 
 }  // namespace mi

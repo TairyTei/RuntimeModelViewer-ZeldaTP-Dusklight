@@ -1,6 +1,7 @@
 #pragma once
 #include "mods/api.h"
-#include "mods/svc/gfx.h"
+
+struct GfxStageContext;
 
 namespace mi {
 
