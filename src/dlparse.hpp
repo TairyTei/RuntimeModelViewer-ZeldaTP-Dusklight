@@ -1,5 +1,6 @@
 #pragma once
 // Parser for J3D shape display lists (GX FIFO command stream, big-endian).
+// Also understands Dusklight's Aurora DRAW_INDEXED command and its host-endian index buffer.
 // Pure C++: the caller supplies the vertex descriptor/format information.
 #include <cstddef>
 #include <cstdint>

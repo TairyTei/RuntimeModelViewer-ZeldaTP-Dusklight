@@ -80,6 +80,13 @@ template <class V> uint32_t array_stride(V& vd, int attr, uint32_t fallback) {
         return fallback;
     }
 }
+template <class V> uint32_t array_count(V& vd, int attr, uint32_t fallback) {
+    if constexpr (requires { vd.getVtxArrNum(static_cast<GXAttr>(attr)); }) {
+        return vd.getVtxArrNum(static_cast<GXAttr>(attr));
+    } else {
+        return fallback;
+    }
+}
 template <class D> const uint8_t* dl_data(D* d) {
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(d->getDisplayList());
     return ptr; // Возвращаем как есть. Если там мусор, мы просто пропустим шейп, но не вылетим.
@@ -117,37 +124,6 @@ float rd_comp(const uint8_t* p, int type, int frac, bool be) {
     case 3: return static_cast<float>(static_cast<int16_t>(rd16(p, be))) * scale;
     default: return rd_f32(p, be);
     }
-}
-
-// Array data is expected in original (big-endian) byte order; verify against the shape bounds.
-bool detect_big_endian(const uint8_t* arr, uint32_t count, uint32_t stride, int type, int frac,
-    float extentHint) {
-    if (arr == nullptr || count == 0) return true;
-    const uint32_t n = std::min<uint32_t>(count, 512);
-    auto sample = [&](bool be, int& good, float& maxAbs) {
-        good = 0;
-        maxAbs = 0.0f;
-        for (uint32_t i = 0; i < n; ++i) {
-            bool ok = true;
-            for (int c = 0; c < 3; ++c) {
-                const float v = rd_comp(arr + i * stride + c * comp_bytes(type), type, frac, be);
-                // wrongly swapped floats typically come out as denormals or huge values
-                const float a = std::fabs(v);
-                if (!std::isfinite(v) || a > 1e6f || (type == 4 && a != 0.0f && a < 1e-9f)) ok = false;
-                else maxAbs = std::max(maxAbs, a);
-            }
-            if (ok) ++good;
-        }
-    };
-    int gb, gl;
-    float mb, ml;
-    sample(true, gb, mb);
-    sample(false, gl, ml);
-    if (type == 4) return gb >= gl;
-    if (extentHint > 0.0f && mb > 0.0f && ml > 0.0f) {
-        return std::fabs(std::log(mb / extentHint)) <= std::fabs(std::log(ml / extentHint));
-    }
-    return true;
 }
 
 struct M34 {
@@ -235,7 +211,8 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     const uint8_t* posArr = reinterpret_cast<const uint8_t*>(vd.getVtxPosArray());
     const uint8_t* uvArr = reinterpret_cast<const uint8_t*>(vd.getVtxTexCoordArray(0));
     const uint32_t vtxNum = vd.getVtxNum();
-    if (posArr == nullptr || vtxNum == 0) {
+    const uint32_t posCount = array_count(vd, 9, vtxNum);
+    if (posArr == nullptr || vtxNum == 0 || posCount == 0) {
         err = "model has no position array";
         return false;
     }
@@ -267,23 +244,9 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         uvFmt.type = 4;
     }
     const uint32_t uvStride = array_stride(vd, 13, 2 * comp_bytes(uvFmt.type));
-
-    // endianness guess from the shape bounds
-    float extent = 0.0f;
-    for (uint16_t i = 0; i < shapeNum; ++i) {
-        J3DShape* s = md->getShapeNodePointer(i);
-        if (s == nullptr) continue;
-        const Vec* mn = s->getMin();
-        const Vec* mx = s->getMax();
-        if (!mn || !mx) continue;
-        for (float v : {mn->x, mn->y, mn->z, mx->x, mx->y, mx->z}) {
-            if (std::isfinite(v)) extent = std::max(extent, std::fabs(v));
-        }
-    }
-    // const bool be = detect_big_endian(posArr, vtxNum, posStride, posType, posFrac, extent);
-    const bool be = false;
-    // const bool be = true;
-    if (!be) logf(1, "vertex arrays look little-endian; reading them that way");
+    const uint32_t uvCount = uvArr != nullptr ? array_count(vd, 13, vtxNum) : 0;
+    // Dusklight swaps J3D vertex-array components to host byte order when loading VTX1.
+    constexpr bool arrayBigEndian = false;
 
     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
     std::vector<VertexRef> tris;
@@ -377,7 +340,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
             for (size_t t = 0; t + 2 < tris.size(); t += 3) {
                 bool invalid = false;
                 for (int k = 0; k < 3; ++k) {
-                    if (tris[t + k].posIdx < 0 || static_cast<uint32_t>(tris[t + k].posIdx) >= vtxNum) {
+                    if (tris[t + k].posIdx < 0 || static_cast<uint32_t>(tris[t + k].posIdx) >= posCount) {
                         invalid = true;
                         break;
                     }
@@ -400,9 +363,9 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                     const VertexRef& vr = tris[t + k];
                     const uint8_t* pp = posArr + static_cast<size_t>(vr.posIdx) * posStride;
 
-                    const float x = rd_comp(pp, posType, posFrac, be);
-                    const float y = rd_comp(pp + comp_bytes(posType), posType, posFrac, be);
-                    const float z = rd_comp(pp + 2 * comp_bytes(posType), posType, posFrac, be);
+                    const float x = rd_comp(pp, posType, posFrac, arrayBigEndian);
+                    const float y = rd_comp(pp + comp_bytes(posType), posType, posFrac, arrayBigEndian);
+                    const float z = rd_comp(pp + 2 * comp_bytes(posType), posType, posFrac, arrayBigEndian);
                     float wx = x, wy = y, wz = z;
                     const int slot = vr.pnmtx >= 0 ? std::min(vr.pnmtx / 3, 9) : 0;
                     const M34& m = slots[slot];
@@ -412,11 +375,11 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                         wz = m.m[2][0] * x + m.m[2][1] * y + m.m[2][2] * z + m.m[2][3];
                     }
                     float u = 0.0f, v = 0.0f;
-                    if (vr.uvIdx >= 0 && static_cast<uint32_t>(vr.uvIdx) < vtxNum && uvArr != nullptr) {
+                    if (vr.uvIdx >= 0 && static_cast<uint32_t>(vr.uvIdx) < uvCount && uvArr != nullptr) {
                         const uint8_t* up = uvArr + static_cast<size_t>(vr.uvIdx) * uvStride;
-                        u = rd_comp(up, uvFmt.type, uvFmt.frac, be);
+                        u = rd_comp(up, uvFmt.type, uvFmt.frac, arrayBigEndian);
                         v = uvFmt.cnt == 0 ? 0.0f
-                                           : rd_comp(up + comp_bytes(uvFmt.type), uvFmt.type, uvFmt.frac, be);
+                                           : rd_comp(up + comp_bytes(uvFmt.type), uvFmt.type, uvFmt.frac, arrayBigEndian);
                     }
                     if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz)) {
                         wx = wy = wz = 0.0f;

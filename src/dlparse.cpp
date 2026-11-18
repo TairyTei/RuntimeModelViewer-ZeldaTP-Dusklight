@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace mi {
 namespace {
@@ -11,6 +12,11 @@ inline uint32_t be32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
 }
 inline uint32_t be16(const uint8_t* p) { return (uint32_t(p[0]) << 8) | p[1]; }
+inline uint16_t host16(const uint8_t* p) {
+    uint16_t value;
+    std::memcpy(&value, p, sizeof(value));
+    return value;
+}
 
 // NBT shares the normal slot in the vertex record.
 int order_key(int attr) { return attr == 25 ? 10 : attr; }
@@ -25,7 +31,19 @@ int comp_size(int t) {
     default: return 0;
     }
 }
-inline uint32_t le16(const uint8_t* p) { return p[0] | (p[1] << 8); }
+
+VertexRef read_vertex_ref(const uint8_t* record, const VertexLayout& layout) {
+    VertexRef ref;
+    if (layout.pnmtxOff >= 0) ref.pnmtx = record[layout.pnmtxOff];
+    ref.posIdx = layout.posBytes == 1 ? record[layout.posOff]
+                                      : static_cast<int>(be16(record + layout.posOff));
+    if (layout.uvOff >= 0) {
+        ref.uvIdx = layout.uvBytes == 1 ? record[layout.uvOff]
+                                        : static_cast<int>(be16(record + layout.uvOff));
+    }
+    return ref;
+}
+
 int direct_bytes(int attr, const AttrFmt& f) {
     if (attr >= 0 && attr <= 8) return 1;
     if (attr == 9) return (f.cnt == 0 ? 2 : 3) * comp_size(f.type);
@@ -107,53 +125,104 @@ bool build_vertex_layout(const std::vector<AttrDesc>& descs,
 bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layout,
     std::vector<VertexRef>& tris, std::string& err, int depth) {
 
-    if (depth > 10) return false;
-    if (dl == nullptr || size == 0) return false;
+    if (depth > 10) {
+        err = "display list nesting limit exceeded";
+        return false;
+    }
+    if (dl == nullptr || size == 0 || layout.stride == 0) {
+        err = "invalid display list or vertex layout";
+        return false;
+    }
 
     size_t p = 0;
     std::vector<VertexRef> v;
     while (p < size) {
         const uint8_t op = dl[p++];
-        if (op == 0x00) continue;  // NOP
-        if (op == 0x08) { p += 5; continue; }
+        if (op == 0x00 || op == 0x48) continue;  // NOP / invalidate vertex cache
+        if (op == 0x08 || op == 0x61) {
+            const size_t bytes = op == 0x08 ? 5 : 4;
+            if (bytes > size - p) { err = "truncated register command"; return false; }
+            p += bytes;
+            continue;
+        }
         if (op == 0x10) {  // XF
-            if (p + 4 > size) break;
+            if (size - p < 4) { err = "truncated XF command"; return false; }
             const size_t n = be16(dl + p) + 1;
-            p += 4 + n * 4;
+            p += 4;
+            if (n > (size - p) / 4) { err = "truncated XF data"; return false; }
+            p += n * 4;
             continue;
         }
-        if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) { p += 4; continue; }
-        if (op == 0x61) { p += 4; continue; }
+        if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
+            if (size - p < 4) { err = "truncated indexed-load command"; return false; }
+            p += 4;
+            continue;
+        }
+        if (op == 0x40) {  // CALL_DL: address and byte count
+            if (size - p < 8) { err = "truncated display-list call"; return false; }
+            p += 8;
+            continue;
+        }
+        if (op == 0x50) {  // Aurora command
+            if (size - p < 9) { err = "truncated Aurora command"; return false; }
+            const uint16_t subcommand = static_cast<uint16_t>(be16(dl + p));
+            if (subcommand != 0x0041) {
+                err = "unsupported Aurora display-list command";
+                return false;
+            }
 
-        // ДОБАВЛЯЕМ 0x68 и 0x70 (LOAD_INDX_C / D)
-        if (op == 0x50 || op == 0x60 || op == 0x68 || op == 0x70) {
-            p += 2;
+            const int prim = dl[p + 2] & 0xF8;
+            const uint32_t vertexCount = be16(dl + p + 3);
+            const uint32_t indexCount = be32(dl + p + 5);
+            if (prim != 0x90 || indexCount % 3 != 0) {
+                err = "invalid Aurora indexed triangle command";
+                return false;
+            }
+
+            const size_t indexStart = p + 9;
+            if (indexCount > (size - indexStart) / sizeof(uint16_t)) {
+                err = "truncated Aurora index data";
+                return false;
+            }
+            const size_t vertexStart = indexStart + static_cast<size_t>(indexCount) * sizeof(uint16_t);
+            if (vertexCount > (size - vertexStart) / layout.stride) {
+                err = "truncated Aurora vertex data";
+                return false;
+            }
+
+            v.clear();
+            v.reserve(vertexCount);
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                v.push_back(read_vertex_ref(dl + vertexStart + static_cast<size_t>(i) * layout.stride, layout));
+            }
+            for (uint32_t i = 0; i < indexCount; i += 3) {
+                const uint16_t a = host16(dl + indexStart + static_cast<size_t>(i) * sizeof(uint16_t));
+                const uint16_t b = host16(dl + indexStart + static_cast<size_t>(i + 1) * sizeof(uint16_t));
+                const uint16_t c = host16(dl + indexStart + static_cast<size_t>(i + 2) * sizeof(uint16_t));
+                if (a >= vertexCount || b >= vertexCount || c >= vertexCount) {
+                    err = "Aurora index is outside the vertex data";
+                    return false;
+                }
+                tris.push_back(v[a]);
+                tris.push_back(v[b]);
+                tris.push_back(v[c]);
+            }
+            p = vertexStart + static_cast<size_t>(vertexCount) * layout.stride;
             continue;
         }
-        if (op == 0x40 || op == 0x48) {  // CALL_DL
-            p += 3;
-            continue;
-        }
-        if (op & 0x80) { // Примитивы
-            const int prim = op & 0xF8;
-            if (p + 2 > size) { err = "truncated"; return false; }
+        const int prim = op & 0xF8;
+        if (prim == 0x80 || prim == 0x90 || prim == 0x98 || prim == 0xA0 ||
+            prim == 0xA8 || prim == 0xB0 || prim == 0xB8) {
+            if (size - p < 2) { err = "truncated primitive header"; return false; }
             uint32_t n = be16(dl + p);
-            if (n > 10000) { err = "too many vertices"; return false; } // Защита
             p += 2;
-            if (p + static_cast<size_t>(n) * layout.stride > size) { err = "truncated"; return false; }
+            if (n > (size - p) / layout.stride) { err = "truncated primitive data"; return false; }
 
             v.clear();
             v.reserve(n);
             for (uint32_t i = 0; i < n; ++i) {
                 const uint8_t* r = dl + p + static_cast<size_t>(i) * layout.stride;
-                VertexRef ref;
-                if (layout.pnmtxOff >= 0) ref.pnmtx = r[layout.pnmtxOff];
-                ref.posIdx = layout.posBytes == 1 ? r[layout.posOff]
-                                                  : static_cast<int>(le16(r + layout.posOff)); // Должно быть le16!
-                if (layout.uvOff >= 0) {
-                    ref.uvIdx = layout.uvBytes == 1 ? r[layout.uvOff]
-                                                    : static_cast<int>(le16(r + layout.uvOff)); // Должно быть le16!
-                }
+                const VertexRef ref = read_vertex_ref(r, layout);
                 if (i < 3) {
                     logf(0, "  vert %u: posIdx=%d uvIdx=%d pnmtx=%d", i, ref.posIdx, ref.uvIdx, ref.pnmtx);
                 }
