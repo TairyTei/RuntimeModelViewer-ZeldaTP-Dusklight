@@ -770,9 +770,8 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err,
         return false;
     }
     for (int i = 0; i < 3; ++i) {
-        // Если координаты вышли за разумные пределы, сбрасываем их в 0
-        out.bmin[i] = (std::isfinite(lo[i]) && std::abs(lo[i]) < 10000.0f) ? lo[i] : 0.0f;
-        out.bmax[i] = (std::isfinite(hi[i]) && std::abs(hi[i]) < 10000.0f) ? hi[i] : 0.0f;
+        out.bmin[i] = std::isfinite(lo[i]) ? lo[i] : 0.0f;
+        out.bmax[i] = std::isfinite(hi[i]) ? hi[i] : 0.0f;
     }
     out.joints = md->getJointNum();
     out.shapes = shapeNum;

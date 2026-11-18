@@ -310,6 +310,12 @@ void set_auto_rotate(ModContext*, void*, const UiControlValue* v) {
 void get_zoom(ModContext*, void*, UiControlValue* out) {
     out->int_value = view().zoomPct;
 }
+void get_fly_speed(ModContext*, void*, UiControlValue* out) {
+    out->int_value = view().flySpeedPct;
+}
+void set_fly_speed(ModContext*, void*, const UiControlValue* v) {
+    view().flySpeedPct = std::clamp(static_cast<int>(v->int_value), 25, 3000);
+}
 void set_zoom(ModContext*, void*, const UiControlValue* v) {
     ViewState& state = view();
     const int zoom = std::clamp(static_cast<int>(v->int_value), 10, 800);
@@ -366,6 +372,7 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
     add_number(left, "Yaw", get_yaw, set_yaw, nullptr, 0, 359, 10, " deg");
     add_number(left, "Pitch", get_int, set_int, &v.pitch, -89, 89, 5, " deg");
     add_number(left, "3D zoom", get_zoom, set_zoom, nullptr, 10, 800, 10, " %");
+    add_number(left, "Fly speed", get_fly_speed, set_fly_speed, nullptr, 25, 3000, 25, " %");
     add_toggle(left, "Nearest texture filtering", &v.nearest);
     svc_ui->pane_add_section(mod_ctx, left, "2D settings");
     add_number(left, "UV zoom", get_uv_zoom, set_uv_zoom, nullptr, 10, 800, 10, " %");
@@ -377,7 +384,7 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
         "The U-/U+/V-/V+ preview buttons shift the UV unwrap by one tile relative to the selected texture. "
         "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance. "
         "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "
-        "In flying mode, WASD moves, Q/E moves vertically, Shift speeds up, and mouse-drag looks around. "
+        "In flying mode, WASD moves, Q/E moves vertically, mouse-drag looks around, and the Fly speed setting controls movement speed; Shift gives a temporary 4x boost. "
         "Auto-rotate stops when you adjust the camera.", nullptr);
     return MOD_OK;
 }

@@ -46,6 +46,7 @@ struct ViewState {
     int pitch = 15;        // degrees
     int zoomPct = 100;
     int uvZoomPct = 100;
+    int flySpeedPct = 500;
     float flyPosition[3] = {0.0f, 0.0f, 0.0f};
     float uvPanX = 0.0f;
     float uvPanY = 0.0f;

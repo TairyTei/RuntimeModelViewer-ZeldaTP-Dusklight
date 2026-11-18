@@ -93,9 +93,7 @@ struct MeshOut {
 
 // ---- 3D wire overlay ----
 @vertex fn vs_wire(v : VIn) -> @builtin(position) vec4<f32> {
-  var p = u.view_proj * vec4<f32>(v.pos, 1.0);
-  p.z = p.z - 0.0004 * p.w;
-  return p;
+  return u.view_proj * vec4<f32>(v.pos, 1.0);
 }
 
 @fragment fn fs_wire() -> @location(0) vec4<f32> {
@@ -332,7 +330,8 @@ WGPUSampler make_sampler(bool nearest) {
 }
 
 WGPURenderPipeline make_pipeline(const char* label, const char* vs, const char* fs,
-    WGPUPrimitiveTopology topo, bool vertexBuffer, bool depth, bool depthWrite) {
+    WGPUPrimitiveTopology topo, bool vertexBuffer, bool depth, bool depthWrite,
+    bool alphaBlend = false) {
     WGPUVertexAttribute attrs[3] = {
         WGPU_VERTEX_ATTRIBUTE_INIT, WGPU_VERTEX_ATTRIBUTE_INIT, WGPU_VERTEX_ATTRIBUTE_INIT};
     attrs[0].format = WGPUVertexFormat_Float32x3;
@@ -352,6 +351,16 @@ WGPURenderPipeline make_pipeline(const char* label, const char* vs, const char* 
 
     WGPUColorTargetState ct = WGPU_COLOR_TARGET_STATE_INIT;
     ct.format = g.colorFormat;
+    WGPUBlendState blend = WGPU_BLEND_STATE_INIT;
+    if (alphaBlend) {
+        blend.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+        blend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+        blend.color.operation = WGPUBlendOperation_Add;
+        blend.alpha.srcFactor = WGPUBlendFactor_One;
+        blend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+        blend.alpha.operation = WGPUBlendOperation_Add;
+        ct.blend = &blend;
+    }
     WGPUFragmentState frag = WGPU_FRAGMENT_STATE_INIT;
     frag.module = g.module;
     frag.entryPoint = {fs, WGPU_STRLEN};
@@ -466,7 +475,7 @@ bool ensure_gpu(const GfxPresentContext& c) {
     g.pTri = make_pipeline("inspector solid", "vs_mesh", "fs_mesh", WGPUPrimitiveTopology_TriangleList,
         true, true, true);
     g.pWire = make_pipeline("inspector wire", "vs_wire", "fs_wire", WGPUPrimitiveTopology_LineList,
-        true, true, false);
+        true, true, false, true);
     g.pUvBg = make_pipeline("inspector uv bg", "vs_quad", "fs_quad",
         WGPUPrimitiveTopology_TriangleList, true, false, false);
     g.pUvWire = make_pipeline("inspector uv wire", "vs_uvwire", "fs_uvwire",
@@ -1199,11 +1208,10 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
         std::memcpy(un.viewProj, vp.m, sizeof(un.viewProj));
         const bool textured = pl.mode == 1 || pl.mode == 3;
         un.p0[0] = textured ? 1.0f : 0.0f;
-        if (pl.mode == 4) {
-            un.color[0] = 0.85f; un.color[1] = 0.9f; un.color[2] = 0.95f; un.color[3] = 1.0f;
-        } else {
-            un.color[0] = 0.02f; un.color[1] = 0.02f; un.color[2] = 0.03f; un.color[3] = 1.0f;
-        }
+        un.color[0] = 0.92f;
+        un.color[1] = 0.95f;
+        un.color[2] = 1.0f;
+        un.color[3] = 0.82f;
         wgpuQueueWriteBuffer(g.queue, g.ubuf, 0, &un, sizeof(un));
         const bool solid = pl.mode <= 3;
         const bool wire = pl.mode >= 2;
@@ -1550,7 +1558,8 @@ void update_preview_input(ViewState& v) {
         const float movementLength = std::sqrt(movement[0] * movement[0] +
             movement[1] * movement[1] + movement[2] * movement[2]);
         if (movementLength > 0.0f) {
-            const float speed = std::clamp(radius * 0.05f, 2.0f, 200.0f) *
+            const float speedScale = static_cast<float>(std::clamp(v.flySpeedPct, 25, 3000)) / 100.0f;
+            const float speed = std::clamp(radius * 0.05f, 2.0f, 200.0f) * speedScale *
                 (speedBoost ? 4.0f : 1.0f);
             for (int i = 0; i < 3; ++i) {
                 v.flyPosition[i] += movement[i] / movementLength * speed * deltaSeconds;
