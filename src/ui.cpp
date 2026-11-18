@@ -5,6 +5,7 @@
 //   View   - display mode, rotation, zoom, filtering.
 #include "ui.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -265,9 +266,14 @@ ModResult update_model_tab(ModContext*, void*, ModError*) {
 // View tab
 // ---------------------------------------------------------------------------------------------
 const char* const kModes[] = {"Solid", "Textured", "Solid + Wire", "Textured + Wire", "Wire", "UV Map"};
+const char* const kAxes[] = {"Y up", "Z up", "X up"};
 
 void get_mode(ModContext*, void*, UiControlValue* out) { out->int_value = view().mode; }
 void set_mode(ModContext*, void*, const UiControlValue* v) { view().mode = static_cast<int>(v->int_value); }
+void get_axis(ModContext*, void*, UiControlValue* out) { out->int_value = view().upAxis; }
+void set_axis(ModContext*, void*, const UiControlValue* v) {
+    view().upAxis = std::clamp(static_cast<int>(v->int_value), 0, 2);
+}
 void on_toggle_preview(ModContext*, void*) {
     if (preview_is_open()) preview_close();
     else preview_open();
@@ -287,6 +293,15 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
     m.option_count = sizeof(kModes) / sizeof(kModes[0]);
     svc_ui->pane_add_control(mod_ctx, left, &m, nullptr);
 
+    UiControlDesc axis = UI_CONTROL_DESC_INIT;
+    axis.kind = UI_CONTROL_DROPDOWN;
+    axis.label = "Up axis";
+    axis.get = get_axis;
+    axis.set = set_axis;
+    axis.options = kAxes;
+    axis.option_count = sizeof(kAxes) / sizeof(kAxes[0]);
+    svc_ui->pane_add_control(mod_ctx, left, &axis, nullptr);
+
     add_toggle(left, "Auto-rotate", &v.autoRotate);
     add_number(left, "Yaw", get_yaw, set_yaw, nullptr, 0, 359, 10, " deg");
     add_number(left, "Pitch", get_int, set_int, &v.pitch, -89, 89, 5, " deg");
@@ -295,7 +310,8 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
 
     svc_ui->pane_add_rml(mod_ctx, right,
         "Modes 0-4 show the 3D model, UV Map shows the unwrap of the selected shapes over a texture.<br/><br/>"
-        "Preview controls: F focuses the model, Alt + left-drag rotates, and right-drag zooms. "
+        "Preview toolbar: click a mode or cycle the up axis. F focuses the model, Alt + left-drag rotates, "
+        "and right-drag zooms. "
         "Auto-rotate stops when you adjust the camera.", nullptr);
     return MOD_OK;
 }

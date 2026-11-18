@@ -4,8 +4,10 @@
 #include "preview.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #include "common.hpp"
 #include "core.hpp"
@@ -136,6 +138,27 @@ struct QuadOut {
   let t = textureSample(tex, smp, i.uv);
   return vec4<f32>(t.rgb, 1.0);
 }
+
+struct OverlayIn {
+  @location(0) pos : vec2<f32>,
+  @location(1) color : vec4<f32>,
+};
+
+struct OverlayOut {
+  @builtin(position) clip : vec4<f32>,
+  @location(0) color : vec4<f32>,
+};
+
+@vertex fn vs_overlay(v : OverlayIn) -> OverlayOut {
+  var o : OverlayOut;
+  o.clip = vec4<f32>(v.pos, 0.0, 1.0);
+  o.color = v.color;
+  return o;
+}
+
+@fragment fn fs_overlay(i : OverlayOut) -> @location(0) vec4<f32> {
+  return i.color;
+}
 )WGSL";
 
 constexpr uint32_t kUniformSize = 128;
@@ -158,8 +181,16 @@ struct PresentPayload {
     uint32_t flags;  // bit0: nearest filtering
     int32_t solo;
     int32_t uvTex;
+    uint32_t upAxis;
+    int32_t hoverControl;
 };
 static_assert(sizeof(PresentPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+
+struct OverlayVertex {
+    float pos[2];
+    float color[4];
+};
+static_assert(sizeof(OverlayVertex) == 24);
 
 // ---------------------------------------------------------------------------------------------
 // Window state (game thread)
@@ -168,9 +199,11 @@ WindowHandle g_window = 0;
 GfxPresentTargetHandle g_target = 0;
 bool g_recreateTarget = false;
 bool g_previousF = false;
+bool g_previousLeftMouse = false;
 int g_dragMode = 0; // 0 none, 1 orbit, 2 zoom
 int g_previousMouseX = 0;
 int g_previousMouseY = 0;
+int32_t g_hoverControl = -1;
 
 // ---------------------------------------------------------------------------------------------
 // GPU state (render worker thread; released from the game thread at shutdown)
@@ -181,10 +214,12 @@ struct Gpu {
     WGPUTextureFormat colorFormat = WGPUTextureFormat_Undefined;
 
     WGPUShaderModule module = nullptr;
-    WGPURenderPipeline pTri = nullptr, pWire = nullptr, pUvBg = nullptr, pUvWire = nullptr;
+    WGPURenderPipeline pTri = nullptr, pWire = nullptr, pUvBg = nullptr, pUvWire = nullptr, pOverlay = nullptr;
     WGPUBindGroupLayout lTri = nullptr, lWire = nullptr, lUvBg = nullptr, lUvWire = nullptr;
 
     WGPUBuffer ubuf = nullptr;
+    WGPUBuffer overlayBuffer = nullptr;
+    uint64_t overlayBufferSize = 0;
     WGPUSampler sampLinear = nullptr, sampNearest = nullptr;
     WGPUTexture texGray = nullptr, texDark = nullptr;
     WGPUTextureView viewGray = nullptr, viewDark = nullptr;
@@ -222,7 +257,7 @@ void release_mesh_gpu() {
 }
 
 void release_pipelines() {
-    rel(g.pTri); rel(g.pWire); rel(g.pUvBg); rel(g.pUvWire);
+    rel(g.pTri); rel(g.pWire); rel(g.pUvBg); rel(g.pUvWire); rel(g.pOverlay);
     rel(g.lTri); rel(g.lWire); rel(g.lUvBg); rel(g.lUvWire);
     rel(g.module);
     g.colorFormat = WGPUTextureFormat_Undefined;
@@ -237,6 +272,8 @@ void release_all_gpu() {
     rel(g.viewGray); rel(g.viewDark);
     rel(g.texGray); rel(g.texDark);
     rel(g.sampLinear); rel(g.sampNearest);
+    rel(g.overlayBuffer);
+    g.overlayBufferSize = 0;
     rel(g.ubuf);
     g.device = nullptr;
     g.queue = nullptr;
@@ -328,6 +365,41 @@ WGPURenderPipeline make_pipeline(const char* label, const char* vs, const char* 
     return wgpuDeviceCreateRenderPipeline(g.device, &pd);
 }
 
+WGPURenderPipeline make_overlay_pipeline() {
+    WGPUVertexAttribute attrs[2] = {WGPU_VERTEX_ATTRIBUTE_INIT, WGPU_VERTEX_ATTRIBUTE_INIT};
+    attrs[0].format = WGPUVertexFormat_Float32x2;
+    attrs[0].offset = 0;
+    attrs[0].shaderLocation = 0;
+    attrs[1].format = WGPUVertexFormat_Float32x4;
+    attrs[1].offset = 8;
+    attrs[1].shaderLocation = 1;
+    WGPUVertexBufferLayout vbl = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+    vbl.stepMode = WGPUVertexStepMode_Vertex;
+    vbl.arrayStride = sizeof(OverlayVertex);
+    vbl.attributeCount = 2;
+    vbl.attributes = attrs;
+
+    WGPUColorTargetState ct = WGPU_COLOR_TARGET_STATE_INIT;
+    ct.format = g.colorFormat;
+    WGPUFragmentState frag = WGPU_FRAGMENT_STATE_INIT;
+    frag.module = g.module;
+    frag.entryPoint = {"fs_overlay", WGPU_STRLEN};
+    frag.targetCount = 1;
+    frag.targets = &ct;
+
+    WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pd.label = {"inspector controls", WGPU_STRLEN};
+    pd.vertex.module = g.module;
+    pd.vertex.entryPoint = {"vs_overlay", WGPU_STRLEN};
+    pd.vertex.bufferCount = 1;
+    pd.vertex.buffers = &vbl;
+    pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pd.primitive.cullMode = WGPUCullMode_None;
+    pd.multisample.count = 1;
+    pd.fragment = &frag;
+    return wgpuDeviceCreateRenderPipeline(g.device, &pd);
+}
+
 bool ensure_gpu(const GfxPresentContext& c) {
     if (g.device != c.device) {
         // first use (or device change): rebuild everything
@@ -349,7 +421,7 @@ bool ensure_gpu(const GfxPresentContext& c) {
         create_rgba(1, 1, dark, g.texDark, g.viewDark);
         if (g.ubuf == nullptr || g.sampLinear == nullptr || g.viewGray == nullptr) return false;
     }
-    if (g.pTri != nullptr && g.colorFormat == c.target_format) return true;
+    if (g.pTri != nullptr && g.pOverlay != nullptr && g.colorFormat == c.target_format) return true;
 
     release_pipelines();
     g.colorFormat = c.target_format;
@@ -369,7 +441,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
         WGPUPrimitiveTopology_TriangleList, false, false, false);
     g.pUvWire = make_pipeline("inspector uv wire", "vs_uvwire", "fs_uvwire",
         WGPUPrimitiveTopology_LineList, true, false, false);
-    if (!g.pTri || !g.pWire || !g.pUvBg || !g.pUvWire) {
+    g.pOverlay = make_overlay_pipeline();
+    if (!g.pTri || !g.pWire || !g.pUvBg || !g.pUvWire || !g.pOverlay) {
         logf(2, "FAILED to create WebGPU pipelines!");
         release_pipelines();
         return false;
@@ -506,6 +579,170 @@ void draw_wire(WGPURenderPassEncoder pass, WGPUBindGroup bg, int32_t solo) {
     }
 }
 
+constexpr const char* kToolbarModes[] = {"SOLID", "TEX", "SOLID+WIRE", "TEX+WIRE", "WIRE", "UV"};
+constexpr float kToolbarModeWidths[] = {72.0f, 58.0f, 126.0f, 116.0f, 58.0f, 44.0f};
+constexpr float kToolbarAxisWidth = 74.0f;
+constexpr float kToolbarGap = 5.0f;
+
+struct ToolbarButton {
+    float x, y, w, h;
+    int32_t id;
+};
+
+std::array<ToolbarButton, 7> toolbar_buttons(float width) {
+    const float scale = width < 620.0f ? std::max(width / 620.0f, 0.65f) : 1.0f;
+    std::array<ToolbarButton, 7> buttons{};
+    float x = 7.0f * scale;
+    const float y = 4.0f * scale;
+    const float h = 28.0f * scale;
+    for (int32_t i = 0; i < 6; ++i) {
+        const float buttonWidth = kToolbarModeWidths[i] * scale;
+        buttons[i] = {x, y, buttonWidth, h, i};
+        x += buttonWidth + kToolbarGap * scale;
+    }
+    buttons[6] = {x, y, kToolbarAxisWidth * scale, h, 6};
+    return buttons;
+}
+
+float toolbar_height(float width) {
+    const auto buttons = toolbar_buttons(width);
+    return buttons[0].y + buttons[0].h + 4.0f;
+}
+
+const char* axis_label(uint32_t axis) {
+    switch (axis) {
+    case 1: return "UP:Z";
+    case 2: return "UP:X";
+    default: return "UP:Y";
+    }
+}
+
+uint8_t glyph_row(char ch, int row) {
+    static constexpr uint8_t s[7] = {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E};
+    static constexpr uint8_t o[7] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+    static constexpr uint8_t l[7] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
+    static constexpr uint8_t i[7] = {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E};
+    static constexpr uint8_t d[7] = {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E};
+    static constexpr uint8_t t[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
+    static constexpr uint8_t e[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F};
+    static constexpr uint8_t x[7] = {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11};
+    static constexpr uint8_t plus[7] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00};
+    static constexpr uint8_t w[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
+    static constexpr uint8_t r[7] = {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11};
+    static constexpr uint8_t u[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+    static constexpr uint8_t v[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04};
+    static constexpr uint8_t p[7] = {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10};
+    static constexpr uint8_t colon[7] = {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00};
+    static constexpr uint8_t y[7] = {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04};
+    if (row < 0 || row >= 7) return 0;
+    const uint8_t* rows = nullptr;
+    switch (ch) {
+    case 'S': rows = s; break;
+    case 'O': rows = o; break;
+    case 'L': rows = l; break;
+    case 'I': rows = i; break;
+    case 'D': rows = d; break;
+    case 'T': rows = t; break;
+    case 'E': rows = e; break;
+    case 'X': rows = x; break;
+    case '+': rows = plus; break;
+    case 'W': rows = w; break;
+    case 'R': rows = r; break;
+    case 'U': rows = u; break;
+    case 'V': rows = v; break;
+    case 'P': rows = p; break;
+    case ':': rows = colon; break;
+    case 'Y': rows = y; break;
+    default: return 0;
+    }
+    return rows[row];
+}
+
+void append_rect(std::vector<OverlayVertex>& vertices, float x0, float y0, float x1, float y1,
+    float width, float height, const float color[4]) {
+    if (x1 <= x0 || y1 <= y0 || width <= 0.0f || height <= 0.0f) return;
+    const float left = 2.0f * x0 / width - 1.0f;
+    const float right = 2.0f * x1 / width - 1.0f;
+    const float top = 1.0f - 2.0f * y0 / height;
+    const float bottom = 1.0f - 2.0f * y1 / height;
+    const auto vertex = [&](float x, float y) {
+        OverlayVertex out{};
+        out.pos[0] = x;
+        out.pos[1] = y;
+        std::memcpy(out.color, color, sizeof(out.color));
+        vertices.push_back(out);
+    };
+    vertex(left, top); vertex(right, top); vertex(left, bottom);
+    vertex(left, bottom); vertex(right, top); vertex(right, bottom);
+}
+
+void append_text(std::vector<OverlayVertex>& vertices, const char* text, float x, float y,
+    float scale, float width, float height, const float color[4]) {
+    for (size_t charIndex = 0; text[charIndex] != '\0'; ++charIndex) {
+        for (int row = 0; row < 7; ++row) {
+            const uint8_t bits = glyph_row(text[charIndex], row);
+            for (int col = 0; col < 5; ++col) {
+                if ((bits & (1u << (4 - col))) == 0) continue;
+                append_rect(vertices, x + (static_cast<float>(charIndex) * 6 + col) * scale,
+                    y + row * scale, x + (static_cast<float>(charIndex) * 6 + col + 1) * scale,
+                    y + (row + 1) * scale, width, height, color);
+            }
+        }
+    }
+}
+
+void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t targetHeight,
+    uint32_t mode, uint32_t upAxis, int32_t hoverControl) {
+    if (g.pOverlay == nullptr || targetWidth == 0 || targetHeight == 0) return;
+    static thread_local std::vector<OverlayVertex> vertices;
+    vertices.clear();
+    vertices.reserve(6000);
+    const float width = static_cast<float>(targetWidth);
+    const float height = static_cast<float>(targetHeight);
+    const auto buttons = toolbar_buttons(width);
+    const float toolbarBg[4] = {0.045f, 0.055f, 0.075f, 1.0f};
+    const float buttonBg[4] = {0.11f, 0.13f, 0.17f, 1.0f};
+    const float activeBg[4] = {0.10f, 0.32f, 0.53f, 1.0f};
+    const float hoverBg[4] = {0.23f, 0.27f, 0.33f, 1.0f};
+    const float textColor[4] = {0.95f, 0.96f, 0.98f, 1.0f};
+    append_rect(vertices, 0, 0, width, toolbar_height(width), width, height, toolbarBg);
+
+    for (const ToolbarButton& button : buttons) {
+        const bool active = button.id == 6 ? false : button.id == static_cast<int32_t>(mode);
+        const float* fill = button.id == hoverControl ? hoverBg : active ? activeBg : buttonBg;
+        append_rect(vertices, button.x, button.y, button.x + button.w, button.y + button.h,
+            width, height, fill);
+        const char* label = button.id == 6 ? axis_label(upAxis) : kToolbarModes[button.id];
+        const float fontScale = std::min(2.0f, button.h / 14.0f);
+        const float textWidth = (static_cast<float>(std::strlen(label)) * 6.0f - 1.0f) * fontScale;
+        const float textHeight = 7.0f * fontScale;
+        const float textX = button.x + (button.w - textWidth) * 0.5f;
+        const float textY = button.y + (button.h - textHeight) * 0.5f;
+        append_text(vertices, label, textX, textY, fontScale, width, height, textColor);
+    }
+    if (vertices.empty()) return;
+
+    const uint64_t bytes = vertices.size() * sizeof(OverlayVertex);
+    if (g.overlayBuffer == nullptr || g.overlayBufferSize < bytes) {
+        rel(g.overlayBuffer);
+        uint64_t capacity = 1;
+        while (capacity < bytes) capacity <<= 1;
+        WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+        bd.label = {"inspector control vertices", WGPU_STRLEN};
+        bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+        bd.size = capacity;
+        g.overlayBuffer = wgpuDeviceCreateBuffer(g.device, &bd);
+        g.overlayBufferSize = g.overlayBuffer != nullptr ? capacity : 0;
+    }
+    if (g.overlayBuffer == nullptr) return;
+
+    wgpuQueueWriteBuffer(g.queue, g.overlayBuffer, 0, vertices.data(), bytes);
+    wgpuRenderPassEncoderSetViewport(pass, 0, 0, width, height, 0.0f, 1.0f);
+    wgpuRenderPassEncoderSetPipeline(pass, g.pOverlay);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g.overlayBuffer, 0, g.overlayBufferSize);
+    wgpuRenderPassEncoderDraw(pass, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+}
+
 void on_present(ModContext*, const GfxPresentContext* c, const void* payload, size_t size, void*) {
     PresentPayload pl{};
     pl.zoom = 1.0f;
@@ -560,9 +797,24 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
             const float dist = radius / std::sin(fov * 0.5f) * 1.05f / std::max(pl.zoom, 0.05f);
             const float yaw = pl.yaw * 3.14159265f / 180.0f;
             const float pitch = pl.pitch * 3.14159265f / 180.0f;
-            const float eye[3] = {ctr[0] + dist * std::cos(pitch) * std::sin(yaw),
-                ctr[1] + dist * std::sin(pitch), ctr[2] + dist * std::cos(pitch) * std::cos(yaw)};
-            const float up[3] = {0, 1, 0};
+            float right[3] = {1, 0, 0};
+            float up[3] = {0, 1, 0};
+            float forward[3] = {0, 0, 1};
+            if (pl.upAxis == 1) {
+                up[0] = 0; up[1] = 0; up[2] = 1;
+                forward[0] = 0; forward[1] = -1; forward[2] = 0;
+            } else if (pl.upAxis == 2) {
+                right[0] = 0; right[1] = -1; right[2] = 0;
+                up[0] = 1; up[1] = 0; up[2] = 0;
+            }
+            const float horizontal = std::cos(pitch);
+            const float eye[3] = {
+                ctr[0] + dist * (horizontal * std::sin(yaw) * right[0] +
+                    std::sin(pitch) * up[0] + horizontal * std::cos(yaw) * forward[0]),
+                ctr[1] + dist * (horizontal * std::sin(yaw) * right[1] +
+                    std::sin(pitch) * up[1] + horizontal * std::cos(yaw) * forward[1]),
+                ctr[2] + dist * (horizontal * std::sin(yaw) * right[2] +
+                    std::sin(pitch) * up[2] + horizontal * std::cos(yaw) * forward[2])};
             const Mat4 view = mat_look_at(eye, ctr, up);
             const Mat4 proj = mat_perspective(fov, w / h, std::max(radius * 0.01f, 0.01f), dist + radius * 4.0f);
             const Mat4 vp = mat_mul(proj, view);
@@ -626,6 +878,9 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
             }
         }
     }
+    if (ready) {
+        draw_toolbar(pass, c->target_width, c->target_height, pl.mode, pl.upAxis, pl.hoverControl);
+    }
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
 }
@@ -644,6 +899,8 @@ void on_window_event(ModContext*, WindowHandle, const WindowEvent* event, void*)
     } else if (event->type == WINDOW_EVENT_FOCUS_LOST) {
         g_dragMode = 0;
         g_previousF = false;
+        g_previousLeftMouse = false;
+        g_hoverControl = -1;
     }
 }
 
@@ -652,6 +909,8 @@ void update_preview_input(ViewState& v) {
     if (g_window == 0 || svc_window->get_info(mod_ctx, g_window, &info) != MOD_OK) {
         g_dragMode = 0;
         g_previousF = false;
+        g_previousLeftMouse = false;
+        g_hoverControl = -1;
         return;
     }
     bool focused = info.focused;
@@ -662,6 +921,7 @@ void update_preview_input(ViewState& v) {
     int mouseY = 0;
     bool leftDown = false;
     bool rightDown = false;
+    int clientWidth = 0;
 #if defined(_WIN32)
     HWND previewWindow = FindWindowW(nullptr, L"Model Preview");
     focused = focused && previewWindow != nullptr && GetForegroundWindow() == previewWindow;
@@ -673,10 +933,19 @@ void update_preview_input(ViewState& v) {
     RECT client{};
     if (focused && GetCursorPos(&cursor) && ScreenToClient(previewWindow, &cursor) &&
         GetClientRect(previewWindow, &client)) {
+        const int rectWidth = client.right - client.left;
+        const int rectHeight = client.bottom - client.top;
+        const float scaleX = rectWidth > 0 && info.pixel_width != 0
+            ? static_cast<float>(info.pixel_width) / rectWidth
+            : 1.0f;
+        const float scaleY = rectHeight > 0 && info.pixel_height != 0
+            ? static_cast<float>(info.pixel_height) / rectHeight
+            : 1.0f;
         pointerInPreview = cursor.x >= client.left && cursor.x < client.right &&
             cursor.y >= client.top && cursor.y < client.bottom;
-        mouseX = cursor.x;
-        mouseY = cursor.y;
+        mouseX = static_cast<int>(std::lround((cursor.x - client.left) * scaleX));
+        mouseY = static_cast<int>(std::lround((cursor.y - client.top) * scaleY));
+        clientWidth = info.pixel_width != 0 ? static_cast<int>(info.pixel_width) : rectWidth;
     }
 #endif
     if (fDown && !g_previousF) {
@@ -689,6 +958,30 @@ void update_preview_input(ViewState& v) {
     g_previousF = fDown;
 
     if (!focused) {
+        g_dragMode = 0;
+        g_previousLeftMouse = false;
+        g_hoverControl = -1;
+        return;
+    }
+
+    g_hoverControl = -1;
+    if (pointerInPreview && mouseY < toolbar_height(static_cast<float>(clientWidth))) {
+        const auto buttons = toolbar_buttons(static_cast<float>(clientWidth));
+        for (const ToolbarButton& button : buttons) {
+            if (mouseX >= button.x && mouseX < button.x + button.w &&
+                mouseY >= button.y && mouseY < button.y + button.h) {
+                g_hoverControl = button.id;
+                break;
+            }
+        }
+    }
+
+    const bool toolbarClick = leftDown && !g_previousLeftMouse && pointerInPreview &&
+        g_hoverControl >= 0 && !alt;
+    g_previousLeftMouse = leftDown;
+    if (toolbarClick) {
+        if (g_hoverControl < 6) v.mode = g_hoverControl;
+        else v.upAxis = (v.upAxis + 1) % 3;
         g_dragMode = 0;
         return;
     }
@@ -712,7 +1005,7 @@ void update_preview_input(ViewState& v) {
     g_previousMouseX = mouseX;
     g_previousMouseY = mouseY;
     if (dragMode == 1) {
-        v.yaw = std::fmod(v.yaw + dx * 0.5f + 360.0f, 360.0f);
+        v.yaw = std::fmod(v.yaw - dx * 0.5f + 360.0f, 360.0f);
         v.pitch = std::clamp(static_cast<int>(std::lround(v.pitch + dy * 0.5f)), -89, 89);
         v.autoRotate = false;
     } else if (dy != 0.0f) {
@@ -753,6 +1046,8 @@ void preview_close() {
     g_recreateTarget = false;
     g_dragMode = 0;
     g_previousF = false;
+    g_previousLeftMouse = false;
+    g_hoverControl = -1;
     if (g_target != 0) {
         if (svc_gfx->unregister_present_target(mod_ctx, g_target) == MOD_OK) g_target = 0;
     }
@@ -777,6 +1072,8 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     pl.flags = v.nearest ? 1u : 0u;
     pl.solo = v.solo;
     pl.uvTex = v.uvTex;
+    pl.upAxis = static_cast<uint32_t>(std::clamp(v.upAxis, 0, 2));
+    pl.hoverControl = g_hoverControl;
     if (svc_gfx->push_present(mod_ctx, g_target, &pl, sizeof(pl)) == MOD_ERROR) {
         g_recreateTarget = true;
     }

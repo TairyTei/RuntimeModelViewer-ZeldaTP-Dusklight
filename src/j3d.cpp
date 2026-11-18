@@ -497,20 +497,35 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         }
         logf(0, "parsing shape %u...", si);
         const uint16_t groups = shape->getMtxGroupNum();
+        M34 slots[10] = {};
         for (uint16_t g = 0; g < groups; ++g) {
             J3DShapeDraw* draw = shape->getShapeDraw(g);
             J3DShapeMtx* smtx = shape->getShapeMtx(g);
             if (draw == nullptr) continue;
 
-            // matrices for the (up to 10) position-matrix slots of this group
-            M34 slots[10] = {}; // Обнуляем, чтобы valid был false
+            // J3D uses 0xFFFF entries to retain the slot value loaded by an earlier group.
+            uint32_t inheritedMatrixSlots = 0;
+            uint32_t unresolvedMatrixSlots = 0;
             if (smtx != nullptr) {
                 const uint16_t n = std::min<uint16_t>(smtx->getUseMtxNum(), 10);
                 for (uint16_t s = 0; s < n; ++s) {
                     const uint16_t d = smtx->getUseMtxIndex(s);
-                    if (d == 0xFFFF || d >= 1024) continue;
+                    if (d == 0xFFFF) {
+                        if (slots[s].valid) ++inheritedMatrixSlots;
+                        else ++unresolvedMatrixSlots;
+                        continue;
+                    }
+                    if (d >= 1024) {
+                        slots[s].valid = false;
+                        ++unresolvedMatrixSlots;
+                        continue;
+                    }
                     const uint16_t idx = md->getDrawMtxIndex(d);
-                    if (idx >= 1024) continue; // Спасаем игру от чтения за границей
+                    if (idx >= 1024) {
+                        slots[s].valid = false;
+                        ++unresolvedMatrixSlots;
+                        continue;
+                    }
                     M34 worldMatrix{};
                     if (md->getDrawMtxFlag(d) == 0) copy_mtx(model->getAnmMtx(idx), worldMatrix);
                     else copy_mtx(model->getWeightAnmMtx(idx), worldMatrix);
@@ -530,6 +545,9 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                         slots[s].m[0][3], slots[s].m[1][3], slots[s].m[2][3]);
                 }
             }
+            logf(0, "shape %u group %u matrix state: inherited=%u unresolved=%u",
+                static_cast<unsigned>(si), static_cast<unsigned>(g),
+                inheritedMatrixSlots, unresolvedMatrixSlots);
 
             tris.clear();
             std::string perr;
@@ -606,6 +624,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
             int minUv = std::numeric_limits<int>::max();
             int maxUv = -1;
             uint32_t pnmtxCounts[10] = {};
+            uint32_t pnmtxUnresolved = 0;
             for (const VertexRef& ref : tris) {
                 minPos = std::min(minPos, ref.posIdx);
                 maxPos = std::max(maxPos, ref.posIdx);
@@ -613,8 +632,13 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                 if (ref.pnmtx < 0) {
                     ++noPnmtx;
                 } else {
-                    const int slot = ref.pnmtx / 3;
-                    if (slot >= 0 && slot < 10) ++pnmtxCounts[slot];
+                    if (ref.pnmtx % 3 != 0 || ref.pnmtx / 3 >= 10) {
+                        ++pnmtxUnresolved;
+                    } else {
+                        const int slot = ref.pnmtx / 3;
+                        ++pnmtxCounts[slot];
+                        if (!slots[slot].valid) ++pnmtxUnresolved;
+                    }
                 }
                 const int uvIdx = ref.uvIdx[uvSource];
                 if (uvIdx < 0) {
@@ -635,12 +659,12 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
             logf(0,
                 "shape %u group %u parse: ok=%u triangles=%zu fastSkinCandidate=%u fallbackUsed=%u "
                 "posRefsInvalid=%u posRange=%d..%d uvRefsMissing=%u uvRefsInvalid=%u uvRange=%d..%d "
-                "pnmtxMissing=%u pnmtxSlots=[%s] error=%s",
+                "pnmtxMissing=%u pnmtxUnresolved=%u pnmtxSlots=[%s] error=%s",
                 static_cast<unsigned>(si), static_cast<unsigned>(g), parsed ? 1u : 0u, tris.size() / 3,
                 fastSkinFallbackCandidate ? 1u : 0u, fastSkinFallbackUsed ? 1u : 0u,
                 invalidPosRefs, minPos == std::numeric_limits<int>::max() ? -1 : minPos, maxPos,
                 missingUvRefs, invalidUvRefs, minUv == std::numeric_limits<int>::max() ? -1 : minUv,
-                maxUv, noPnmtx, pnmtxSummary.c_str(), perr.empty() ? "-" : perr.c_str());
+                maxUv, noPnmtx, pnmtxUnresolved, pnmtxSummary.c_str(), perr.empty() ? "-" : perr.c_str());
             if (!parsed && dlErr.empty()) {
                 dlErr = perr.empty() ? "display list could not be parsed" : perr;
             }
@@ -679,10 +703,14 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                     const float y = rd_comp(pp + comp_bytes(posType), posType, posFrac, arrayBigEndian);
                     const float z = rd_comp(pp + 2 * comp_bytes(posType), posType, posFrac, arrayBigEndian);
                     float wx = x, wy = y, wz = z;
-                    const int slot = vr.pnmtx >= 0 ? std::min(vr.pnmtx / 3, 9) : 0;
-                    const M34& m = slots[slot];
-                    if (!positionsDeformed && m.valid) {
-                        transform_point(m, x, y, z, wx, wy, wz);
+                    const int slot = vr.pnmtx < 0
+                        ? 0
+                        : (vr.pnmtx % 3 == 0 ? vr.pnmtx / 3 : -1);
+                    const M34* m = slot >= 0 && slot < 10 && slots[slot].valid
+                        ? &slots[slot]
+                        : nullptr;
+                    if (!positionsDeformed && m != nullptr) {
+                        transform_point(*m, x, y, z, wx, wy, wz);
                     } else if (positionsDeformed && hasModelBaseInverse) {
                         transform_point(modelBaseInverse, x, y, z, wx, wy, wz);
                     }

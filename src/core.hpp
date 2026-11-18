@@ -46,6 +46,7 @@ struct ViewState {
     float yaw = 30.0f;     // degrees
     int pitch = 15;        // degrees
     int zoomPct = 100;
+    int upAxis = 0;        // 0 = Y-up, 1 = Z-up, 2 = X-up
     int solo = -1;         // shape index shown alone, -1 = all
     int uvTex = -1;        // texture index shown behind the UV map, -1 = none
 };
