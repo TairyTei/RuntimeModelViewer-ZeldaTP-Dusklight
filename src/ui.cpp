@@ -295,7 +295,8 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
 
     svc_ui->pane_add_rml(mod_ctx, right,
         "Modes 0-4 show the 3D model, UV Map shows the unwrap of the selected shapes over a texture.<br/><br/>"
-        "The preview window has no mouse control yet; use Yaw / Pitch / Zoom here.", nullptr);
+        "Preview controls: F focuses the model, Alt + left-drag rotates, and right-drag zooms. "
+        "Auto-rotate stops when you adjust the camera.", nullptr);
     return MOD_OK;
 }
 

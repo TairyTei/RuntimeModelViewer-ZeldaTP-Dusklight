@@ -14,6 +14,16 @@
 #include "mods/svc/window.h"
 #include <webgpu/webgpu.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
+
 namespace mi {
 namespace {
 
@@ -157,6 +167,10 @@ static_assert(sizeof(PresentPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 WindowHandle g_window = 0;
 GfxPresentTargetHandle g_target = 0;
 bool g_recreateTarget = false;
+bool g_previousF = false;
+int g_dragMode = 0; // 0 none, 1 orbit, 2 zoom
+int g_previousMouseX = 0;
+int g_previousMouseY = 0;
 
 // ---------------------------------------------------------------------------------------------
 // GPU state (render worker thread; released from the game thread at shutdown)
@@ -464,6 +478,23 @@ WGPUTextureView view_for(int32_t tex, WGPUTextureView fallback) {
 
 bool sub_visible(const SubMesh& s, int32_t solo) { return solo < 0 || static_cast<int32_t>(s.shapeIndex) == solo; }
 
+int32_t default_uv_texture(const MeshData& mesh, int32_t solo) {
+    if (solo >= 0) {
+        for (const SubMesh& s : mesh.subs) {
+            if (static_cast<int32_t>(s.shapeIndex) == solo && view_for(s.texture, nullptr) != nullptr) {
+                return s.texture;
+            }
+        }
+    }
+    for (const SubMesh& s : mesh.subs) {
+        if (s.texture >= 0 && view_for(s.texture, nullptr) != nullptr) return s.texture;
+    }
+    for (size_t i = 0; i < g.views.size(); ++i) {
+        if (g.views[i] != nullptr) return static_cast<int32_t>(i);
+    }
+    return -1;
+}
+
 void draw_wire(WGPURenderPassEncoder pass, WGPUBindGroup bg, int32_t solo) {
     if (g.mesh == nullptr || g.vbuf == nullptr || g.ibuf == nullptr) return;
     wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
@@ -579,7 +610,8 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
             wgpuQueueWriteBuffer(g.queue, g.ubuf, 0, &un, sizeof(un));
 
             WGPUSampler samp = (pl.flags & 1u) ? g.sampNearest : g.sampLinear;
-            WGPUBindGroup bgq = make_bg(g.lUvBg, view_for(pl.uvTex, g.viewDark), samp);
+            const int32_t uvTexture = pl.uvTex >= 0 ? pl.uvTex : default_uv_texture(*g.mesh, pl.solo);
+            WGPUBindGroup bgq = make_bg(g.lUvBg, view_for(uvTexture, g.viewDark), samp);
             if (bgq != nullptr) {
                 wgpuRenderPassEncoderSetPipeline(pass, g.pUvBg);
                 wgpuRenderPassEncoderSetBindGroup(pass, 0, bgq, 0, nullptr);
@@ -607,7 +639,87 @@ ModResult register_target() {
 }
 
 void on_window_event(ModContext*, WindowHandle, const WindowEvent* event, void*) {
-    if (event->type == WINDOW_EVENT_CLOSE_REQUESTED) preview_close();
+    if (event->type == WINDOW_EVENT_CLOSE_REQUESTED) {
+        preview_close();
+    } else if (event->type == WINDOW_EVENT_FOCUS_LOST) {
+        g_dragMode = 0;
+        g_previousF = false;
+    }
+}
+
+void update_preview_input(ViewState& v) {
+    WindowInfo info = WINDOW_INFO_INIT;
+    if (g_window == 0 || svc_window->get_info(mod_ctx, g_window, &info) != MOD_OK) {
+        g_dragMode = 0;
+        g_previousF = false;
+        return;
+    }
+    bool focused = info.focused;
+    bool fDown = false;
+    bool alt = false;
+    bool pointerInPreview = false;
+    int mouseX = 0;
+    int mouseY = 0;
+    bool leftDown = false;
+    bool rightDown = false;
+#if defined(_WIN32)
+    HWND previewWindow = FindWindowW(nullptr, L"Model Preview");
+    focused = focused && previewWindow != nullptr && GetForegroundWindow() == previewWindow;
+    fDown = focused && (GetAsyncKeyState('F') & 0x8000) != 0;
+    alt = focused && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    POINT cursor{};
+    RECT client{};
+    if (focused && GetCursorPos(&cursor) && ScreenToClient(previewWindow, &cursor) &&
+        GetClientRect(previewWindow, &client)) {
+        pointerInPreview = cursor.x >= client.left && cursor.x < client.right &&
+            cursor.y >= client.top && cursor.y < client.bottom;
+        mouseX = cursor.x;
+        mouseY = cursor.y;
+    }
+#endif
+    if (fDown && !g_previousF) {
+        v.yaw = 30.0f;
+        v.pitch = 15;
+        v.zoomPct = 100;
+        v.autoRotate = false;
+        g_dragMode = 0;
+    }
+    g_previousF = fDown;
+
+    if (!focused) {
+        g_dragMode = 0;
+        return;
+    }
+
+    const int dragMode = pointerInPreview && alt && leftDown ? 1 :
+        pointerInPreview && rightDown ? 2 : 0;
+
+    if (dragMode == 0) {
+        g_dragMode = 0;
+        return;
+    }
+    if (dragMode != g_dragMode) {
+        g_dragMode = dragMode;
+        g_previousMouseX = mouseX;
+        g_previousMouseY = mouseY;
+        return;
+    }
+
+    const float dx = static_cast<float>(mouseX - g_previousMouseX);
+    const float dy = static_cast<float>(mouseY - g_previousMouseY);
+    g_previousMouseX = mouseX;
+    g_previousMouseY = mouseY;
+    if (dragMode == 1) {
+        v.yaw = std::fmod(v.yaw + dx * 0.5f + 360.0f, 360.0f);
+        v.pitch = std::clamp(static_cast<int>(std::lround(v.pitch + dy * 0.5f)), -89, 89);
+        v.autoRotate = false;
+    } else if (dy != 0.0f) {
+        const float zoom = static_cast<float>(v.zoomPct) * std::exp(-dy * 0.01f);
+        v.zoomPct = std::clamp(static_cast<int>(std::lround(zoom)), 10, 800);
+        v.autoRotate = false;
+    }
 }
 
 }  // namespace
@@ -639,6 +751,8 @@ ModResult preview_open() {
 
 void preview_close() {
     g_recreateTarget = false;
+    g_dragMode = 0;
+    g_previousF = false;
     if (g_target != 0) {
         if (svc_gfx->unregister_present_target(mod_ctx, g_target) == MOD_OK) g_target = 0;
     }
@@ -650,6 +764,7 @@ void preview_close() {
 void preview_frame(ModContext*, const GfxStageContext*, void*) {
     if (g_target == 0) return;
     ViewState& v = view();
+    update_preview_input(v);
     if (v.autoRotate && v.mode != 5) {
         v.yaw = std::fmod(v.yaw + 0.7f, 360.0f);
     }

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -92,6 +93,10 @@ template <class D> const uint8_t* dl_data(D* d) {
     return ptr; // Возвращаем как есть. Если там мусор, мы просто пропустим шейп, но не вылетим.
 }
 template <class D> uint32_t dl_size(D* d) { return static_cast<uint32_t>(d->getDisplayListSize()); }
+template <class S> bool original_has_pnmtx(S* shape) {
+    if constexpr (requires { shape->hasPNMTXIdx(); }) return shape->hasPNMTXIdx();
+    else return false;
+}
 
 // ---------- raw array reading ----------
 inline uint16_t rd16(const uint8_t* p, bool be) {
@@ -138,6 +143,49 @@ template <class P> void copy_mtx(P src, M34& out) {
     out.valid = true;
 }
 
+template <class P> bool inverse_affine(P src, M34& out) {
+    const float a = src[0][0], b = src[0][1], c = src[0][2];
+    const float d = src[1][0], e = src[1][1], f = src[1][2];
+    const float g = src[2][0], h = src[2][1], i = src[2][2];
+    const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (!std::isfinite(det) || std::abs(det) < 1e-8f) return false;
+
+    const float invDet = 1.0f / det;
+    out.m[0][0] = (e * i - f * h) * invDet;
+    out.m[0][1] = (c * h - b * i) * invDet;
+    out.m[0][2] = (b * f - c * e) * invDet;
+    out.m[1][0] = (f * g - d * i) * invDet;
+    out.m[1][1] = (a * i - c * g) * invDet;
+    out.m[1][2] = (c * d - a * f) * invDet;
+    out.m[2][0] = (d * h - e * g) * invDet;
+    out.m[2][1] = (b * g - a * h) * invDet;
+    out.m[2][2] = (a * e - b * d) * invDet;
+    for (int r = 0; r < 3; ++r) {
+        out.m[r][3] = 0.0f;
+        for (int k = 0; k < 3; ++k) out.m[r][3] -= out.m[r][k] * src[k][3];
+    }
+    out.valid = true;
+    return true;
+}
+
+M34 multiply_affine(const M34& a, const M34& b) {
+    M34 out;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out.m[r][c] = c == 3 ? a.m[r][3] : 0.0f;
+            for (int k = 0; k < 3; ++k) out.m[r][c] += a.m[r][k] * b.m[k][c];
+        }
+    }
+    out.valid = a.valid && b.valid;
+    return out;
+}
+
+void transform_point(const M34& m, float x, float y, float z, float& ox, float& oy, float& oz) {
+    ox = m.m[0][0] * x + m.m[0][1] * y + m.m[0][2] * z + m.m[0][3];
+    oy = m.m[1][0] * x + m.m[1][1] * y + m.m[1][2] * z + m.m[1][3];
+    oz = m.m[2][0] * x + m.m[2][1] * y + m.m[2][2] * z + m.m[2][3];
+}
+
 float model_radius(J3DModelData* md) {
     static std::map<uintptr_t, float> cache;
     const uintptr_t k = reinterpret_cast<uintptr_t>(md);
@@ -173,6 +221,22 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     }
     J3DVertexData& vd = md->getVertexData();
     const uint16_t shapeNum = md->getShapeNum();
+    const uint8_t* sourcePosArr = reinterpret_cast<const uint8_t*>(vd.getVtxPosArray());
+    void* currentPos = model->getVertexBuffer()->getCurrentVtxPos();
+    const bool cpuSkinPos = model->checkFlag(J3DMdlFlag_SkinPosCpu);
+    logf(0,
+        "snapshot begin: model=%p data=%p shapes=%u joints=%u materials=%u verts=%u "
+        "fastSkin=%u skinDeform=%p cpuSkinPos=%u sourcePos=%p currentPos=%p",
+        static_cast<void*>(model), static_cast<void*>(md), static_cast<unsigned>(shapeNum),
+        static_cast<unsigned>(md->getJointNum()), static_cast<unsigned>(md->getMaterialNum()),
+        vd.getVtxNum(), md->checkFlag(0x100) ? 1u : 0u,
+        static_cast<void*>(model->getSkinDeform()), cpuSkinPos ? 1u : 0u,
+        static_cast<const void*>(sourcePosArr), currentPos);
+    M34 modelBaseInverse{};
+    const bool hasModelBaseInverse = inverse_affine(model->getBaseTRMtx(), modelBaseInverse);
+    Mtx& modelBase = model->getBaseTRMtx();
+    logf(0, "model base: invertible=%u translation=(%.3f,%.3f,%.3f)",
+        hasModelBaseInverse ? 1u : 0u, modelBase[0][3], modelBase[1][3], modelBase[2][3]);
 
     // ---- textures (decode all; shapes refer to them by index) ----
     // ---- textures ----
@@ -187,19 +251,39 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
 
             // Включаем чтение текстур обратно:
             const uint8_t fmt = static_cast<uint8_t>(res->format);
-            const uint32_t imgOff = static_cast<uint32_t>(res->imageOffset);
+            const int32_t imgOff = static_cast<int32_t>(res->imageOffset);
+            const int32_t palOff = static_cast<int32_t>(res->paletteOffset);
             const uint8_t* base = reinterpret_cast<const uint8_t*>(res);
+            const uint8_t* image = texTable->getImgDataPtr(static_cast<uint16_t>(i));
+            const bool runtimeImagePointer = image != nullptr;
+            const uint8_t* dataBase = runtimeImagePointer
+                ? image - imgOff
+                : base;
+            if (image == nullptr) {
+                image = base + (imgOff == 0 ? sizeof(*res) : imgOff);
+            }
             const uint8_t* pal = nullptr;
             uint32_t palCount = 0;
             uint8_t palFmt = static_cast<uint8_t>(res->colorFormat);
             if (fmt == 8 || fmt == 9 || fmt == 10) {
                 palCount = static_cast<uint32_t>(res->numColors);
-                pal = base + static_cast<uint32_t>(res->paletteOffset);
+                pal = dataBase + palOff;
             }
-            if (imgOff != 0 && decode_gc_texture(base + imgOff, w, h, fmt, pal, palFmt, palCount, ti.rgba)) {
+            const bool decoded = decode_gc_texture(image, w, h, fmt, pal, palFmt, palCount, ti.rgba);
+            if (decoded) {
                 ti.w = w;
                 ti.h = h;
+            } else {
+                logf(1, "texture %u not decoded: format=%u size=%ux%u offsets image=%d palette=%d",
+                    i, fmt, w, h, imgOff, palOff);
             }
+            logf(0,
+                "texture %u import: decoded=%u format=%u size=%ux%u imageOffset=%d paletteOffset=%d "
+                "paletteFmt=%u colors=%u rgbaBytes=%zu runtimeImage=%u dataBase=%p image=%p palette=%p",
+                i, decoded ? 1u : 0u, static_cast<unsigned>(fmt), w, h, imgOff, palOff,
+                static_cast<unsigned>(palFmt), palCount,
+                ti.rgba.size(), runtimeImagePointer ? 1u : 0u, static_cast<const void*>(dataBase),
+                static_cast<const void*>(image), static_cast<const void*>(pal));
 
             char d[64];
             std::snprintf(d, sizeof(d), "%ux%u %s", w, h, gc_format_name(fmt));
@@ -208,8 +292,14 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         }
 
     // ---- vertex arrays ----
-    const uint8_t* posArr = reinterpret_cast<const uint8_t*>(vd.getVtxPosArray());
-    const uint8_t* uvArr = reinterpret_cast<const uint8_t*>(vd.getVtxTexCoordArray(0));
+    const uint8_t* posArr = sourcePosArr;
+    bool positionsDeformed = false;
+    if (currentPos != nullptr) {
+        if (currentPos != sourcePosArr) {
+            posArr = reinterpret_cast<const uint8_t*>(currentPos);
+            positionsDeformed = cpuSkinPos;
+        }
+    }
     const uint32_t vtxNum = vd.getVtxNum();
     const uint32_t posCount = array_count(vd, 9, vtxNum);
     if (posArr == nullptr || vtxNum == 0 || posCount == 0) {
@@ -220,8 +310,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     const int posFrac = vd.getVtxPosFrac();
     const uint32_t posStride = array_stride(vd, 9, 3 * comp_bytes(posType));
 
-    // TEX0 format from the vertex attribute format list
-    AttrFmt uvFmt;
+    // TEXn formats from the vertex attribute format list
     std::vector<AttrFmt> fmts(32);
     if (auto* list = vd.getVtxAttrFmtList()) {
         for (int i = 0; i < 40; ++i) {
@@ -237,16 +326,45 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         logf(0, "fmts: pos found=%d cnt=%d type=%d frac=%d, uv found=%d",
              fmts[9].found, fmts[9].cnt, fmts[9].type, fmts[9].frac, fmts[13].found);
     }
-    uvFmt = fmts[13];
-    if (!uvFmt.found) {
-        uvFmt.found = true;
-        uvFmt.cnt = 1;
-        uvFmt.type = 4;
+    const uint8_t* uvArr[8] = {};
+    uint32_t uvStrides[8] = {};
+    uint32_t uvCounts[8] = {};
+    AttrFmt uvFmts[8] = {};
+    for (int i = 0; i < 8; ++i) {
+        uvArr[i] = reinterpret_cast<const uint8_t*>(vd.getVtxTexCoordArray(static_cast<uint8_t>(i)));
+        uvFmts[i] = fmts[13 + i];
+        if (!uvFmts[i].found) {
+            uvFmts[i].found = true;
+            uvFmts[i].cnt = 1;
+            uvFmts[i].type = 4;
+        }
+        uvStrides[i] = array_stride(vd, 13 + i, 2 * comp_bytes(uvFmts[i].type));
+        uvCounts[i] = uvArr[i] != nullptr ? array_count(vd, 13 + i, vtxNum) : 0;
     }
-    const uint32_t uvStride = array_stride(vd, 13, 2 * comp_bytes(uvFmt.type));
-    const uint32_t uvCount = uvArr != nullptr ? array_count(vd, 13, vtxNum) : 0;
+    logf(0,
+        "vertex arrays: posType=%d frac=%d count=%u stride=%u current=%p usingCurrent=%u cpuDeformed=%u",
+        posType, posFrac, posCount, posStride, static_cast<const void*>(posArr),
+        posArr != sourcePosArr ? 1u : 0u, positionsDeformed ? 1u : 0u);
+    for (int i = 0; i < 8; ++i) {
+        if (uvArr[i] != nullptr) {
+            logf(0, "TEX%u array=%p count=%u stride=%u type=%d frac=%d components=%d",
+                static_cast<unsigned>(i), static_cast<const void*>(uvArr[i]), uvCounts[i],
+                uvStrides[i], uvFmts[i].type, uvFmts[i].frac, uvFmts[i].cnt);
+        }
+    }
     // Dusklight swaps J3D vertex-array components to host byte order when loading VTX1.
     constexpr bool arrayBigEndian = false;
+    const auto indicesValid = [&](const std::vector<VertexRef>& refs) {
+        return std::all_of(refs.begin(), refs.end(), [&](const VertexRef& ref) {
+            if (ref.posIdx < 0 || static_cast<uint32_t>(ref.posIdx) >= posCount) return false;
+            for (size_t i = 0; i < ref.uvIdx.size(); ++i) {
+                if (ref.uvIdx[i] >= 0 &&
+                    (uvArr[i] == nullptr ||
+                     static_cast<uint32_t>(ref.uvIdx[i]) >= uvCounts[i])) return false;
+            }
+            return true;
+        });
+    };
 
     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
     std::vector<VertexRef> tris;
@@ -266,6 +384,9 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                 descs.push_back({a, d_type(dlist[i])});
             }
         }
+        const bool hasPnmtxDesc = std::any_of(descs.begin(), descs.end(),
+            [](const AttrDesc& d) { return d.attr == 0 && d.type != 0; });
+        const bool originalPnm = original_has_pnmtx(shape);
         VertexLayout layout;
         std::string lerr;
         if (!build_vertex_layout(descs, [&](int a) { return (a >= 0 && a < 32) ? fmts[a] : AttrFmt{}; },
@@ -278,26 +399,103 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
         for (const AttrDesc& d : descs) {
             dbg += std::to_string(d.attr) + ":" + std::to_string(d.type) + " ";
         }
-        logf(0, "shape %u: stride=%u | posOff=%d posBytes=%d | descs: %s",
-             si, layout.stride, layout.posOff, layout.posBytes, dbg.c_str());
+        logf(0, "shape %u: stride=%u | posOff=%d posBytes=%d | pnmDesc=%u originalPnm=%u | descs: %s",
+             static_cast<unsigned>(si), layout.stride, layout.posOff, layout.posBytes,
+             hasPnmtxDesc ? 1u : 0u, originalPnm ? 1u : 0u, dbg.c_str());
 
         SubMesh sub;
         sub.shapeIndex = si;
         sub.firstVertex = static_cast<uint32_t>(out.vertices.size() / 6);
         sub.texture = -1;
+        int uvSource = 0;
+        int materialIndex = -1;
+        int selectedTevStage = -1;
+        int selectedTexMap = -1;
+        int selectedTexCoord = -1;
+        int selectedTexSource = -1;
+        int selectedTexMtxReg = -1;
+        float uvMatrix[2][4] = {{1.0f, 0.0f, 0.0f, 0.0f},
+                                {0.0f, 1.0f, 0.0f, 0.0f}};
+        bool applyUvMatrix = false;
         if (J3DMaterial* mat = shape->getMaterial()) {
+            materialIndex = mat->getIndex();
             if (const char* nm = mat_name(*mat)) sub.label = nm;
             if (mat->getTevBlock() != nullptr) {
-                for (uint32_t k = 0; k < 8; ++k) {
-                    const uint16_t t = mat->getTexNo(k);
-                    if (t != 0xFFFF && t < texCount) {
-                        sub.texture = static_cast<int32_t>(t);
-                        break;
+                int firstActiveTexture = -1;
+                int firstActiveStage = -1;
+                int firstActiveMap = -1;
+                for (uint32_t stage = 0; stage < mat->getTevStageNum(); ++stage) {
+                    J3DTevOrder* order = mat->getTevBlock()->getTevOrder(stage);
+                    if (order == nullptr || order->getTexMap() >= 8) continue;
+
+                    const uint16_t t = mat->getTexNo(order->getTexMap());
+                    if (t == 0xFFFF || t >= texCount) continue;
+                    if (firstActiveTexture < 0) {
+                        firstActiveTexture = static_cast<int>(t);
+                        firstActiveStage = static_cast<int>(stage);
+                        firstActiveMap = order->getTexMap();
                     }
+
+                    const uint8_t coord = order->mTexCoord;
+                    if (coord >= mat->getTexGenNum()) continue;
+                    J3DTexCoord* texCoord = mat->getTexCoord(coord);
+                    if (texCoord == nullptr) continue;
+                    const uint8_t source = texCoord->getTexGenSrc();
+                    if (source < GX_TG_TEX0 || source > GX_TG_TEX7) continue;
+                    const int sourceIndex = source - GX_TG_TEX0;
+                    if (uvArr[sourceIndex] == nullptr) {
+                        logf(1, "shape %u material texture uses missing TEX%u array",
+                            si, static_cast<unsigned>(sourceIndex));
+                        continue;
+                    }
+
+                    sub.texture = static_cast<int32_t>(t);
+                    uvSource = sourceIndex;
+                    selectedTevStage = static_cast<int>(stage);
+                    selectedTexMap = order->getTexMap();
+                    selectedTexCoord = coord;
+                    selectedTexSource = source;
+                    const uint8_t texGenType = texCoord->getTexGenType();
+                    const uint32_t texMtxReg = texCoord->getTexMtxReg();
+                    selectedTexMtxReg = static_cast<int>(texMtxReg);
+                    if (texGenType == GX_MTX2x4 && texMtxReg >= GX_TEXMTX0 &&
+                        texMtxReg <= GX_TEXMTX9 && (texMtxReg - GX_TEXMTX0) % 3 == 0) {
+                        if (J3DTexMtx* texMtx = mat->getTexMtx((texMtxReg - GX_TEXMTX0) / 3)) {
+                            Mtx& matrix = texMtx->getMtx();
+                            bool finite = true;
+                            for (int row = 0; row < 2; ++row) {
+                                for (int col = 0; col < 4; ++col) {
+                                    uvMatrix[row][col] = matrix[row][col];
+                                    finite = finite && std::isfinite(uvMatrix[row][col]);
+                                }
+                            }
+                            applyUvMatrix = finite;
+                            if (!finite) {
+                                logf(1, "shape %u has a non-finite texture matrix; using raw UVs", si);
+                            }
+                        }
+                    }
+                    break;
+                }
+                if (sub.texture < 0) {
+                    sub.texture = firstActiveTexture;
+                    selectedTevStage = firstActiveStage;
+                    selectedTexMap = firstActiveMap;
                 }
             }
         }
-                logf(0, "parsing shape %u...", si);
+        logf(0,
+            "shape %u material map: material=%d label=%s texture=%d tevStage=%d texMap=%d "
+            "texCoord=%d source=%d uvArray=%p texMtxReg=%d matrixApplied=%u",
+            static_cast<unsigned>(si), materialIndex, sub.label.empty() ? "-" : sub.label.c_str(),
+            sub.texture, selectedTevStage, selectedTexMap, selectedTexCoord, selectedTexSource,
+            static_cast<const void*>(uvArr[uvSource]), selectedTexMtxReg, applyUvMatrix ? 1u : 0u);
+        if (applyUvMatrix) {
+            logf(0, "shape %u UV matrix: [%g %g %g %g] [%g %g %g %g]",
+                static_cast<unsigned>(si), uvMatrix[0][0], uvMatrix[0][1], uvMatrix[0][2],
+                uvMatrix[0][3], uvMatrix[1][0], uvMatrix[1][1], uvMatrix[1][2], uvMatrix[1][3]);
+        }
+        logf(0, "parsing shape %u...", si);
         const uint16_t groups = shape->getMtxGroupNum();
         for (uint16_t g = 0; g < groups; ++g) {
             J3DShapeDraw* draw = shape->getShapeDraw(g);
@@ -313,24 +511,138 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                     if (d == 0xFFFF || d >= 1024) continue;
                     const uint16_t idx = md->getDrawMtxIndex(d);
                     if (idx >= 1024) continue; // Спасаем игру от чтения за границей
-                    if (md->getDrawMtxFlag(d) == 0) copy_mtx(model->getAnmMtx(idx), slots[s]);
-                    else copy_mtx(model->getWeightAnmMtx(idx), slots[s]);
+                    M34 worldMatrix{};
+                    if (md->getDrawMtxFlag(d) == 0) copy_mtx(model->getAnmMtx(idx), worldMatrix);
+                    else copy_mtx(model->getWeightAnmMtx(idx), worldMatrix);
+                    if (worldMatrix.valid && hasModelBaseInverse) {
+                        slots[s] = multiply_affine(modelBaseInverse, worldMatrix);
+                    } else if (worldMatrix.valid) {
+                        worldMatrix.valid = false;
+                        slots[s] = worldMatrix;
+                    }
+                    logf(0,
+                        "shape %u group %u matrix slot %u: draw=%u matrix=%u weighted=%u valid=%u "
+                        "worldTranslation=(%.3f,%.3f,%.3f) localTranslation=(%.3f,%.3f,%.3f)",
+                        static_cast<unsigned>(si), static_cast<unsigned>(g), static_cast<unsigned>(s),
+                        static_cast<unsigned>(d), static_cast<unsigned>(idx),
+                        md->getDrawMtxFlag(d) ? 1u : 0u, worldMatrix.valid ? 1u : 0u,
+                        worldMatrix.m[0][3], worldMatrix.m[1][3], worldMatrix.m[2][3],
+                        slots[s].m[0][3], slots[s].m[1][3], slots[s].m[2][3]);
                 }
             }
 
             tris.clear();
             std::string perr;
+            bool parsed = false;
+            bool fastSkinFallbackCandidate = false;
+            bool fastSkinFallbackUsed = false;
             const uint8_t* dl_ptr = dl_data(draw);
             uint32_t dl_len = dl_size(draw);
             if (dl_len > 1024 * 1024) dl_len = 1024 * 1024; // Защита от чтения гигабайтов
+            logf(0, "shape %u group %u draw: ptr=%p len=%u groups=%u usedMatrices=%u cpuSkinPos=%u",
+                static_cast<unsigned>(si), static_cast<unsigned>(g), static_cast<const void*>(dl_ptr),
+                dl_len, static_cast<unsigned>(groups),
+                smtx != nullptr ? static_cast<unsigned>(smtx->getUseMtxNum()) : 0u,
+                positionsDeformed ? 1u : 0u);
             if (dl_ptr != nullptr && dl_len > 0) {
-                logf(0, "DL ptr=%p len=%u bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
-                    (void*)dl_ptr, dl_len, dl_ptr[0], dl_ptr[1], dl_ptr[2], dl_ptr[3],
-                    dl_ptr[4], dl_ptr[5], dl_ptr[6], dl_ptr[7]);
-
-                if (!parse_display_list(dl_ptr, dl_len, layout, tris, perr) && dlErr.empty()) {
-                    dlErr = perr;
+                if (dl_len >= 8) {
+                    logf(0, "DL prefix: %02X %02X %02X %02X %02X %02X %02X %02X",
+                        dl_ptr[0], dl_ptr[1], dl_ptr[2], dl_ptr[3],
+                        dl_ptr[4], dl_ptr[5], dl_ptr[6], dl_ptr[7]);
+                } else {
+                    logf(0, "DL prefix: only %u byte(s) available", dl_len);
                 }
+
+                VertexLayout drawLayout = layout;
+                parsed = parse_display_list(dl_ptr, dl_len, drawLayout, tris, perr);
+                fastSkinFallbackCandidate =
+                    md->checkFlag(0x100) && model->getSkinDeform() != nullptr &&
+                    !hasPnmtxDesc && dl_ptr[0] == 0x50;
+                if (fastSkinFallbackCandidate) {
+                    std::vector<AttrDesc> drawDescs = descs;
+                    drawDescs.push_back({0, 1});
+                    std::string drawLayoutErr;
+                    VertexLayout fallbackLayout;
+                    if (build_vertex_layout(drawDescs,
+                            [&](int a) { return (a >= 0 && a < 32) ? fmts[a] : AttrFmt{}; },
+                            fallbackLayout, drawLayoutErr)) {
+                        std::vector<VertexRef> fallbackTris;
+                        std::string fallbackErr;
+                        const bool fallbackParsed =
+                            parse_display_list(dl_ptr, dl_len, fallbackLayout, fallbackTris, fallbackErr);
+                        const uint16_t matrixSlots = smtx != nullptr
+                            ? std::min<uint16_t>(smtx->getUseMtxNum(), 10)
+                            : 0;
+                        const bool fallbackPnmValid = fallbackParsed && !fallbackTris.empty() &&
+                            matrixSlots != 0 &&
+                            std::all_of(fallbackTris.begin(), fallbackTris.end(), [&](const VertexRef& ref) {
+                                return ref.pnmtx >= 0 && ref.pnmtx % 3 == 0 &&
+                                    static_cast<uint16_t>(ref.pnmtx / 3) < matrixSlots;
+                            });
+                        if (fallbackPnmValid && indicesValid(fallbackTris)) {
+                            drawLayout = fallbackLayout;
+                            tris = std::move(fallbackTris);
+                            parsed = true;
+                            fastSkinFallbackUsed = true;
+                            perr.clear();
+                            logf(1, "shape %u: restored PNMTXIDX byte for fast-skin display list", si);
+                        } else {
+                            logf(1, "shape %u: fast-skin layout fallback rejected: pnmValid=%u matrixSlots=%u error=%s",
+                                si, fallbackPnmValid ? 1u : 0u, static_cast<unsigned>(matrixSlots),
+                                fallbackErr.c_str());
+                        }
+                    } else {
+                        logf(1, "shape %u: fast-skin layout fallback failed: %s",
+                            si, drawLayoutErr.c_str());
+                    }
+                }
+            }
+            uint32_t noPnmtx = 0;
+            uint32_t invalidPosRefs = 0;
+            uint32_t missingUvRefs = 0;
+            uint32_t invalidUvRefs = 0;
+            int minPos = std::numeric_limits<int>::max();
+            int maxPos = -1;
+            int minUv = std::numeric_limits<int>::max();
+            int maxUv = -1;
+            uint32_t pnmtxCounts[10] = {};
+            for (const VertexRef& ref : tris) {
+                minPos = std::min(minPos, ref.posIdx);
+                maxPos = std::max(maxPos, ref.posIdx);
+                if (ref.posIdx < 0 || static_cast<uint32_t>(ref.posIdx) >= posCount) ++invalidPosRefs;
+                if (ref.pnmtx < 0) {
+                    ++noPnmtx;
+                } else {
+                    const int slot = ref.pnmtx / 3;
+                    if (slot >= 0 && slot < 10) ++pnmtxCounts[slot];
+                }
+                const int uvIdx = ref.uvIdx[uvSource];
+                if (uvIdx < 0) {
+                    ++missingUvRefs;
+                } else {
+                    minUv = std::min(minUv, uvIdx);
+                    maxUv = std::max(maxUv, uvIdx);
+                    if (uvArr[uvSource] == nullptr ||
+                        static_cast<uint32_t>(uvIdx) >= uvCounts[uvSource]) ++invalidUvRefs;
+                }
+            }
+            std::string pnmtxSummary;
+            for (int slot = 0; slot < 10; ++slot) {
+                if (pnmtxCounts[slot] != 0) {
+                    pnmtxSummary += std::to_string(slot) + ":" + std::to_string(pnmtxCounts[slot]) + " ";
+                }
+            }
+            logf(0,
+                "shape %u group %u parse: ok=%u triangles=%zu fastSkinCandidate=%u fallbackUsed=%u "
+                "posRefsInvalid=%u posRange=%d..%d uvRefsMissing=%u uvRefsInvalid=%u uvRange=%d..%d "
+                "pnmtxMissing=%u pnmtxSlots=[%s] error=%s",
+                static_cast<unsigned>(si), static_cast<unsigned>(g), parsed ? 1u : 0u, tris.size() / 3,
+                fastSkinFallbackCandidate ? 1u : 0u, fastSkinFallbackUsed ? 1u : 0u,
+                invalidPosRefs, minPos == std::numeric_limits<int>::max() ? -1 : minPos, maxPos,
+                missingUvRefs, invalidUvRefs, minUv == std::numeric_limits<int>::max() ? -1 : minUv,
+                maxUv, noPnmtx, pnmtxSummary.c_str(), perr.empty() ? "-" : perr.c_str());
+            if (!parsed && dlErr.empty()) {
+                dlErr = perr.empty() ? "display list could not be parsed" : perr;
             }
 
             if (tris.size() > 100000) {
@@ -369,17 +681,29 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
                     float wx = x, wy = y, wz = z;
                     const int slot = vr.pnmtx >= 0 ? std::min(vr.pnmtx / 3, 9) : 0;
                     const M34& m = slots[slot];
-                    if (m.valid) {
-                        wx = m.m[0][0] * x + m.m[0][1] * y + m.m[0][2] * z + m.m[0][3];
-                        wy = m.m[1][0] * x + m.m[1][1] * y + m.m[1][2] * z + m.m[1][3];
-                        wz = m.m[2][0] * x + m.m[2][1] * y + m.m[2][2] * z + m.m[2][3];
+                    if (!positionsDeformed && m.valid) {
+                        transform_point(m, x, y, z, wx, wy, wz);
+                    } else if (positionsDeformed && hasModelBaseInverse) {
+                        transform_point(modelBaseInverse, x, y, z, wx, wy, wz);
                     }
                     float u = 0.0f, v = 0.0f;
-                    if (vr.uvIdx >= 0 && static_cast<uint32_t>(vr.uvIdx) < uvCount && uvArr != nullptr) {
-                        const uint8_t* up = uvArr + static_cast<size_t>(vr.uvIdx) * uvStride;
-                        u = rd_comp(up, uvFmt.type, uvFmt.frac, arrayBigEndian);
-                        v = uvFmt.cnt == 0 ? 0.0f
-                                           : rd_comp(up + comp_bytes(uvFmt.type), uvFmt.type, uvFmt.frac, arrayBigEndian);
+                    const int uvIdx = vr.uvIdx[uvSource];
+                    if (uvIdx >= 0 && static_cast<uint32_t>(uvIdx) < uvCounts[uvSource] &&
+                        uvArr[uvSource] != nullptr) {
+                        const uint8_t* up = uvArr[uvSource] +
+                            static_cast<size_t>(uvIdx) * uvStrides[uvSource];
+                        u = rd_comp(up, uvFmts[uvSource].type, uvFmts[uvSource].frac, arrayBigEndian);
+                        v = uvFmts[uvSource].cnt == 0 ? 0.0f
+                            : rd_comp(up + comp_bytes(uvFmts[uvSource].type),
+                                      uvFmts[uvSource].type, uvFmts[uvSource].frac, arrayBigEndian);
+                        if (applyUvMatrix) {
+                            const float transformedU =
+                                uvMatrix[0][0] * u + uvMatrix[0][1] * v + uvMatrix[0][3];
+                            const float transformedV =
+                                uvMatrix[1][0] * u + uvMatrix[1][1] * v + uvMatrix[1][3];
+                            u = transformedU;
+                            v = transformedV;
+                        }
                     }
                     if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz)) {
                         wx = wy = wz = 0.0f;
@@ -409,6 +733,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     if (badIndex > 0) logf(1, "%u vertex indices were out of range (wrong array layout?)", badIndex);
     if (out.vertices.empty()) {
         err = dlErr.empty() ? "no triangles found" : dlErr;
+        logf(1, "snapshot failed: model=%p error=%s", static_cast<void*>(model), err.c_str());
         return false;
     }
     for (int i = 0; i < 3; ++i) {
@@ -421,6 +746,16 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err) {
     out.materials = md->getMaterialNum();
     out.vertexCount = static_cast<uint32_t>(out.vertices.size() / 6);
     out.triCount = out.vertexCount / 3;
+    uint32_t decodedTextures = 0;
+    for (const TexImage& texture : out.textures) {
+        if (texture.w != 0 && texture.h != 0 && !texture.rgba.empty()) ++decodedTextures;
+    }
+    logf(0,
+        "snapshot complete: model=%p vertices=%u triangles=%u submeshes=%zu textures=%zu "
+        "decodedTextures=%u badTriangles=%u bounds=[(%g,%g,%g)-(%g,%g,%g)]",
+        static_cast<void*>(model), out.vertexCount, out.triCount, out.subs.size(),
+        out.textures.size(), decodedTextures, badIndex,
+        out.bmin[0], out.bmin[1], out.bmin[2], out.bmax[0], out.bmax[1], out.bmax[2]);
     return true;
 }
 

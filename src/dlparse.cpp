@@ -37,9 +37,11 @@ VertexRef read_vertex_ref(const uint8_t* record, const VertexLayout& layout) {
     if (layout.pnmtxOff >= 0) ref.pnmtx = record[layout.pnmtxOff];
     ref.posIdx = layout.posBytes == 1 ? record[layout.posOff]
                                       : static_cast<int>(be16(record + layout.posOff));
-    if (layout.uvOff >= 0) {
-        ref.uvIdx = layout.uvBytes == 1 ? record[layout.uvOff]
-                                        : static_cast<int>(be16(record + layout.uvOff));
+    for (size_t i = 0; i < layout.uvOffs.size(); ++i) {
+        if (layout.uvOffs[i] >= 0) {
+            ref.uvIdx[i] = layout.uvBytes[i] == 1 ? record[layout.uvOffs[i]]
+                                                  : static_cast<int>(be16(record + layout.uvOffs[i]));
+        }
     }
     return ref;
 }
@@ -99,9 +101,10 @@ bool build_vertex_layout(const std::vector<AttrDesc>& descs,
             out.posOff = static_cast<int>(off);
             out.posBytes = d.type == 2 ? 1 : 2;
         }
-        if (d.attr == 13 && d.type != 1) {
-            out.uvOff = static_cast<int>(off);
-            out.uvBytes = d.type == 2 ? 1 : 2;
+        if (d.attr >= 13 && d.attr <= 20 && d.type != 1) {
+            const size_t texCoord = static_cast<size_t>(d.attr - 13);
+            out.uvOffs[texCoord] = static_cast<int>(off);
+            out.uvBytes[texCoord] = d.type == 2 ? 1 : 2;
         }
         off += static_cast<uint32_t>(bytes);
     }
@@ -174,6 +177,11 @@ bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layo
             const int prim = dl[p + 2] & 0xF8;
             const uint32_t vertexCount = be16(dl + p + 3);
             const uint32_t indexCount = be32(dl + p + 5);
+            logf(0,
+                "Aurora DRAW_INDEXED: primitive=0x%02X vertices=%u indices=%u vertexStride=%u "
+                "indexOffset=%zu vertexOffset=%zu",
+                prim, vertexCount, indexCount, layout.stride, p + 9,
+                p + 9 + static_cast<size_t>(indexCount) * sizeof(uint16_t));
             if (prim != 0x90 || indexCount % 3 != 0) {
                 err = "invalid Aurora indexed triangle command";
                 return false;
@@ -224,7 +232,8 @@ bool parse_display_list(const uint8_t* dl, size_t size, const VertexLayout& layo
                 const uint8_t* r = dl + p + static_cast<size_t>(i) * layout.stride;
                 const VertexRef ref = read_vertex_ref(r, layout);
                 if (i < 3) {
-                    logf(0, "  vert %u: posIdx=%d uvIdx=%d pnmtx=%d", i, ref.posIdx, ref.uvIdx, ref.pnmtx);
+                    logf(0, "  vert %u: posIdx=%d uv0Idx=%d pnmtx=%d",
+                        i, ref.posIdx, ref.uvIdx[0], ref.pnmtx);
                 }
                 v.push_back(ref);
             }

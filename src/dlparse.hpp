@@ -2,6 +2,7 @@
 // Parser for J3D shape display lists (GX FIFO command stream, big-endian).
 // Also understands Dusklight's Aurora DRAW_INDEXED command and its host-endian index buffer.
 // Pure C++: the caller supplies the vertex descriptor/format information.
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -30,14 +31,14 @@ struct VertexLayout {
     int pnmtxOff = -1;     // direct u8 position-matrix index (value = slot * 3)
     int posOff = -1;
     int posBytes = 0;      // 1 or 2 (INDEX8 / INDEX16)
-    int uvOff = -1;        // TEX0 index
-    int uvBytes = 0;
+    std::array<int, 8> uvOffs = {-1, -1, -1, -1, -1, -1, -1, -1};
+    std::array<int, 8> uvBytes = {};
 };
 
 struct VertexRef {
     int pnmtx = -1;  // -1 when the vertex record has no matrix index
     int posIdx = 0;
-    int uvIdx = -1;
+    std::array<int, 8> uvIdx = {-1, -1, -1, -1, -1, -1, -1, -1};
 };
 
 bool build_vertex_layout(const std::vector<AttrDesc>& descs,
