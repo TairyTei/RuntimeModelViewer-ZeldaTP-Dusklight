@@ -177,6 +177,7 @@ static_assert(sizeof(Uniforms) <= kUniformSize);
 
 struct PresentPayload {
     uint64_t version;
+    uint64_t selectedKey;
     float yaw;    // degrees
     float pitch;  // degrees
     float zoom;   // factor, 1 = fit
@@ -238,7 +239,8 @@ struct Gpu {
     WGPUBindGroupLayout lTri = nullptr, lTriAlpha = nullptr, lWire = nullptr, lUvBg = nullptr,
         lUvWire = nullptr;
 
-    WGPUBuffer ubuf = nullptr, alphaUbuf = nullptr, uvUbuf = nullptr, uvWireUbuf = nullptr;
+    WGPUBuffer ubuf = nullptr, alphaUbuf = nullptr, highlightUbuf = nullptr, uvUbuf = nullptr,
+        uvWireUbuf = nullptr;
     WGPUBuffer overlayBuffer = nullptr;
     uint64_t overlayBufferSize = 0;
     WGPUSampler sampLinear = nullptr, sampNearest = nullptr;
@@ -256,6 +258,9 @@ struct Gpu {
     uint64_t uvBgVbufSize = 0;
     std::vector<WGPUTexture> texs;
     std::vector<WGPUTextureView> views;
+    std::array<std::vector<WGPUBindGroup>, 2> triBindGroups;
+    std::array<std::vector<WGPUBindGroup>, 2> alphaBindGroups;
+    WGPUBindGroup wireBindGroup = nullptr, highlightBindGroup = nullptr;
 };
 Gpu g;
 
@@ -263,11 +268,24 @@ void rel(WGPUTextureView& v) { if (v) { wgpuTextureViewRelease(v); v = nullptr; 
 void rel(WGPUTexture& t) { if (t) { wgpuTextureRelease(t); t = nullptr; } }
 void rel(WGPUBuffer& b) { if (b) { wgpuBufferRelease(b); b = nullptr; } }
 void rel(WGPUSampler& s) { if (s) { wgpuSamplerRelease(s); s = nullptr; } }
+void rel(WGPUBindGroup& b) { if (b) { wgpuBindGroupRelease(b); b = nullptr; } }
 void rel(WGPURenderPipeline& p) { if (p) { wgpuRenderPipelineRelease(p); p = nullptr; } }
 void rel(WGPUBindGroupLayout& l) { if (l) { wgpuBindGroupLayoutRelease(l); l = nullptr; } }
 void rel(WGPUShaderModule& m) { if (m) { wgpuShaderModuleRelease(m); m = nullptr; } }
 
+void release_mesh_bind_groups() {
+    for (auto& groups : g.triBindGroups) {
+        for (auto& group : groups) rel(group);
+        groups.clear();
+    }
+    for (auto& groups : g.alphaBindGroups) {
+        for (auto& group : groups) rel(group);
+        groups.clear();
+    }
+}
+
 void release_mesh_gpu() {
+    release_mesh_bind_groups();
     rel(g.vbuf);
     rel(g.uvBgVbuf);
     rel(g.ibuf);
@@ -281,6 +299,9 @@ void release_mesh_gpu() {
 }
 
 void release_pipelines() {
+    release_mesh_bind_groups();
+    rel(g.wireBindGroup);
+    rel(g.highlightBindGroup);
     rel(g.pTri); rel(g.pTriAlpha); rel(g.pWire); rel(g.pUvBg); rel(g.pUvWire); rel(g.pOverlay);
     rel(g.lTri); rel(g.lTriAlpha); rel(g.lWire); rel(g.lUvBg); rel(g.lUvWire);
     rel(g.module);
@@ -300,6 +321,7 @@ void release_all_gpu() {
     g.overlayBufferSize = 0;
     rel(g.ubuf);
     rel(g.alphaUbuf);
+    rel(g.highlightUbuf);
     rel(g.uvUbuf);
     rel(g.uvWireUbuf);
     g.device = nullptr;
@@ -385,7 +407,7 @@ WGPURenderPipeline make_pipeline(const char* label, const char* vs, const char* 
     WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
     ds.format = WGPUTextureFormat_Depth32Float;
     ds.depthWriteEnabled = depthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
-    ds.depthCompare = WGPUCompareFunction_LessEqual;
+    ds.depthCompare = WGPUCompareFunction_GreaterEqual;
 
     WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     pd.label = {label, WGPU_STRLEN};
@@ -445,7 +467,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
         g.device = c.device;
         g.queue = c.queue;
     }
-    if (g.ubuf == nullptr || g.alphaUbuf == nullptr || g.uvUbuf == nullptr ||
+    if (g.ubuf == nullptr || g.alphaUbuf == nullptr || g.highlightUbuf == nullptr ||
+        g.uvUbuf == nullptr ||
         g.uvWireUbuf == nullptr ||
         g.sampLinear == nullptr || g.sampNearest == nullptr ||
         g.viewGray == nullptr || g.viewDark == nullptr) {
@@ -456,6 +479,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
         if (g.ubuf == nullptr) g.ubuf = wgpuDeviceCreateBuffer(g.device, &bd);
         bd.label = {"inspector alpha uniforms", WGPU_STRLEN};
         if (g.alphaUbuf == nullptr) g.alphaUbuf = wgpuDeviceCreateBuffer(g.device, &bd);
+        bd.label = {"inspector selection highlight uniforms", WGPU_STRLEN};
+        if (g.highlightUbuf == nullptr) g.highlightUbuf = wgpuDeviceCreateBuffer(g.device, &bd);
         bd.label = {"inspector UV uniforms", WGPU_STRLEN};
         if (g.uvUbuf == nullptr) g.uvUbuf = wgpuDeviceCreateBuffer(g.device, &bd);
         bd.label = {"inspector UV wire uniforms", WGPU_STRLEN};
@@ -474,7 +499,8 @@ bool ensure_gpu(const GfxPresentContext& c) {
             rel(g.texDark);
             create_rgba(1, 1, dark, g.texDark, g.viewDark);
         }
-        if (g.ubuf == nullptr || g.alphaUbuf == nullptr || g.uvUbuf == nullptr ||
+        if (g.ubuf == nullptr || g.alphaUbuf == nullptr || g.highlightUbuf == nullptr ||
+            g.uvUbuf == nullptr ||
             g.uvWireUbuf == nullptr ||
             g.sampLinear == nullptr || g.sampNearest == nullptr ||
             g.viewGray == nullptr || g.viewDark == nullptr) return false;
@@ -554,7 +580,10 @@ void sync_mesh() {
         }
         if (sameLayout) {
             const uint64_t bytes = static_cast<uint64_t>(mesh->vertices.size()) * sizeof(float);
-            wgpuQueueWriteBuffer(g.queue, g.vbuf, 0, mesh->vertices.data(), bytes);
+            if (!std::equal(mesh->vertices.begin(), mesh->vertices.end(),
+                    g.mesh->vertices.begin())) {
+                wgpuQueueWriteBuffer(g.queue, g.vbuf, 0, mesh->vertices.data(), bytes);
+            }
             g.mesh = std::move(mesh);
             g.meshVersion = g.mesh->version;
             return;
@@ -635,6 +664,34 @@ WGPUTextureView view_for(int32_t tex, WGPUTextureView fallback) {
     return fallback;
 }
 
+WGPUBindGroup cached_mesh_bg(int32_t texture, bool nearest, bool alpha) {
+    const size_t textureIndex = texture >= 0 && static_cast<size_t>(texture) < g.views.size() &&
+        g.views[static_cast<size_t>(texture)] != nullptr
+        ? static_cast<size_t>(texture) : g.views.size();
+    auto& samplerGroups = alpha ? g.alphaBindGroups[nearest ? 1 : 0]
+        : g.triBindGroups[nearest ? 1 : 0];
+    if (samplerGroups.size() != g.views.size() + 1) {
+        samplerGroups.resize(g.views.size() + 1, nullptr);
+    }
+    WGPUBindGroup& group = samplerGroups[textureIndex];
+    if (group == nullptr) {
+        const WGPUTextureView view = textureIndex == g.views.size()
+            ? g.viewGray : g.views[textureIndex];
+        group = make_bg(alpha ? g.lTriAlpha : g.lTri, view,
+            nearest ? g.sampNearest : g.sampLinear, alpha ? g.alphaUbuf : nullptr);
+    }
+    return group;
+}
+
+WGPUBindGroup cached_wire_bg(bool highlight) {
+    WGPUBindGroup& group = highlight ? g.highlightBindGroup : g.wireBindGroup;
+    if (group == nullptr) {
+        group = make_bg(g.lWire, nullptr, nullptr,
+            highlight ? g.highlightUbuf : nullptr);
+    }
+    return group;
+}
+
 bool sub_visible(const SubMesh& s, int32_t solo) { return solo < 0 || static_cast<int32_t>(s.shapeIndex) == solo; }
 
 int32_t default_uv_texture(const MeshData& mesh, int32_t solo) {
@@ -655,13 +712,14 @@ int32_t default_uv_texture(const MeshData& mesh, int32_t solo) {
 }
 
 void draw_wire(WGPURenderPassEncoder pass, WGPUBindGroup bg, int32_t solo,
-    WGPUBuffer vertexBuffer, uint64_t vertexBufferSize) {
+    WGPUBuffer vertexBuffer, uint64_t vertexBufferSize, uint64_t instanceKey = 0) {
     if (g.mesh == nullptr || vertexBuffer == nullptr || g.ibuf == nullptr) return;
     wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertexBuffer, 0, vertexBufferSize);
     wgpuRenderPassEncoderSetIndexBuffer(pass, g.ibuf, WGPUIndexFormat_Uint32, 0, g.ibufSize);
     for (const SubMesh& s : g.mesh->subs) {
-        if (!sub_visible(s, solo)) continue;
+        if (!sub_visible(s, solo) ||
+            (instanceKey != 0 && s.instanceKey != instanceKey)) continue;
         wgpuRenderPassEncoderDrawIndexed(pass, s.vertexCount * 2, 1, s.firstVertex * 2, 0, 0);
     }
 }
@@ -701,7 +759,14 @@ struct ToolbarButton {
     int32_t id;
 };
 
-std::vector<ToolbarButton> toolbar_buttons(float width, PreviewLayout layout, uint32_t mode) {
+bool live_control_available() {
+    if (scene_view_enabled()) return true;
+    const std::shared_ptr<const MeshData> mesh = current_mesh();
+    return mesh == nullptr || mesh->joints != 0 || !mesh->geometryCacheable;
+}
+
+std::vector<ToolbarButton> toolbar_buttons(
+    float width, PreviewLayout layout, uint32_t mode, bool showLiveControl = true) {
     std::vector<ToolbarButton> buttons;
     buttons.reserve(12);
     const float categoryY = 4.0f;
@@ -734,8 +799,11 @@ std::vector<ToolbarButton> toolbar_buttons(float width, PreviewLayout layout, ui
         buttons.push_back({controlX, controlsY, kToolbarFlyWidth * scale, controlsH, kFlyControl});
         controlX += kToolbarFlyWidth * scale + kToolbarGap * scale;
         buttons.push_back({controlX, controlsY, kToolbarAxisWidth * scale, controlsH, kAxisControl});
-        controlX += kToolbarAxisWidth * scale + kToolbarGap * scale;
-        buttons.push_back({controlX, controlsY, kToolbarLiveWidth * scale, controlsH, kLiveControl});
+        if (showLiveControl) {
+            controlX += kToolbarAxisWidth * scale + kToolbarGap * scale;
+            buttons.push_back({controlX, controlsY, kToolbarLiveWidth * scale, controlsH,
+                kLiveControl});
+        }
     }
     if (layout != PreviewLayout::ThreeD) {
         const float regionLeft = layout == PreviewLayout::Both ? width * 0.5f : 0.0f;
@@ -966,14 +1034,14 @@ void draw_toolbar(WGPURenderPassEncoder pass, uint32_t targetWidth, uint32_t tar
     PreviewLayout layout, uint32_t mode, uint32_t upAxis, int32_t hoverControl, uint32_t flyingCamera,
     int32_t solo, int32_t uvTex, int32_t uvTileOffsetX, int32_t uvTileOffsetY,
     uint32_t textureMenuOpen, int32_t texturePage, uint32_t shapeMenuOpen, int32_t shapePage,
-    uint32_t liveUpdate) {
+    uint32_t liveUpdate, bool showLiveControl) {
     if (g.pOverlay == nullptr || targetWidth == 0 || targetHeight == 0) return;
     static thread_local std::vector<OverlayVertex> vertices;
     vertices.clear();
     vertices.reserve(6000);
     const float width = static_cast<float>(targetWidth);
     const float height = static_cast<float>(targetHeight);
-    const auto buttons = toolbar_buttons(width, layout, mode);
+    const auto buttons = toolbar_buttons(width, layout, mode, showLiveControl);
     const float toolbarBg[4] = {0.045f, 0.055f, 0.075f, 1.0f};
     const float buttonBg[4] = {0.11f, 0.13f, 0.17f, 1.0f};
     const float activeBg[4] = {0.10f, 0.32f, 0.53f, 1.0f};
@@ -1207,6 +1275,13 @@ void mesh_sphere(const MeshData* mesh, float center[3], float& radius) {
     if (!std::isfinite(radius) || radius <= 0.0f) radius = 1.0f;
 }
 
+void focused_mesh_sphere(const MeshData* mesh, uint64_t selectedKey,
+    float center[3], float& radius) {
+    if (!scene_focus_sphere(selectedKey, center, radius)) {
+        mesh_sphere(mesh, center, radius);
+    }
+}
+
 void orbit_eye(const float center[3], float radius, float yawDegrees, float pitchDegrees,
     float zoom, uint32_t upAxis, float eye[3]) {
     float right[3], up[3], forward[3];
@@ -1238,7 +1313,7 @@ void initialize_fly_position(ViewState& v) {
     float center[3];
     float radius = 1.0f;
     const std::shared_ptr<const MeshData> mesh = current_mesh();
-    mesh_sphere(mesh.get(), center, radius);
+    focused_mesh_sphere(mesh.get(), selected_key(), center, radius);
     orbit_eye(center, radius, v.yaw, static_cast<float>(v.pitch),
         static_cast<float>(v.zoomPct) / 100.0f, static_cast<uint32_t>(std::clamp(v.upAxis, 0, 2)),
         v.flyPosition);
@@ -1270,7 +1345,7 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
     da.view = g.depthView;
     da.depthLoadOp = WGPULoadOp_Clear;
     da.depthStoreOp = WGPUStoreOp_Store;
-    da.depthClearValue = 1.0f;
+    da.depthClearValue = 0.0f;
 
     const bool show3D = layout != PreviewLayout::TwoD;
     const bool showUV = layout != PreviewLayout::ThreeD;
@@ -1294,9 +1369,12 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
     if (haveMesh && show3D) {
         wgpuRenderPassEncoderSetViewport(pass, 0, toolbar, leftWidth, contentHeight, 0.0f, 1.0f);
         const MeshData& mesh = *g.mesh;
+        float sceneCenter[3];
+        float sceneRadius = 1.0f;
+        mesh_sphere(&mesh, sceneCenter, sceneRadius);
         float center[3];
         float radius = 1.0f;
-        mesh_sphere(&mesh, center, radius);
+        focused_mesh_sphere(&mesh, pl.selectedKey, center, radius);
         const float fov = 40.0f * 3.14159265f / 180.0f;
         float eye[3], target[3], up[3], right[3], axisForward[3];
         axis_basis(pl.upAxis, right, up, axisForward);
@@ -1309,15 +1387,18 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
             orbit_eye(center, radius, pl.yaw, pl.pitch, pl.zoom, pl.upAxis, eye);
             std::memcpy(target, center, sizeof(target));
         }
-        const float dx = eye[0] - center[0];
-        const float dy = eye[1] - center[1];
-        const float dz = eye[2] - center[2];
-        const float cameraDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
-        const float nearPlane = std::max(radius * 0.0001f, 0.01f);
-        const float farPlane = std::max({radius * 4.0f, cameraDistance + radius * 2.0f,
-            nearPlane + 1.0f});
+        const float sceneDx = eye[0] - sceneCenter[0];
+        const float sceneDy = eye[1] - sceneCenter[1];
+        const float sceneDz = eye[2] - sceneCenter[2];
+        const float sceneDistance = std::sqrt(sceneDx * sceneDx + sceneDy * sceneDy +
+            sceneDz * sceneDz);
+        const float nearPlane = std::max(std::min(radius * 0.001f,
+            sceneRadius * 0.0001f), 0.01f);
+        const float farPlane = std::max({sceneDistance + sceneRadius * 1.25f,
+            sceneRadius * 2.0f, nearPlane + 1.0f});
         const Mat4 viewMatrix = mat_look_at(eye, target, up);
-        const Mat4 proj = mat_perspective(fov, leftWidth / contentHeight, nearPlane, farPlane);
+        const Mat4 proj = mat_perspective_reversed_z(
+            fov, leftWidth / contentHeight, nearPlane, farPlane);
         const Mat4 vp = mat_mul(proj, viewMatrix);
         Uniforms un{};
         std::memcpy(un.viewProj, vp.m, sizeof(un.viewProj));
@@ -1329,6 +1410,12 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
         un.color[2] = 0.0f;
         un.color[3] = 0.5f;
         wgpuQueueWriteBuffer(g.queue, g.ubuf, 0, &un, sizeof(un));
+        Uniforms highlight = un;
+        highlight.color[0] = 1.0f;
+        highlight.color[1] = 0.62f;
+        highlight.color[2] = 0.05f;
+        highlight.color[3] = 0.9f;
+        wgpuQueueWriteBuffer(g.queue, g.highlightUbuf, 0, &highlight, sizeof(highlight));
         if (textured) {
             Uniforms alphaUn = un;
             alphaUn.p0[1] = 2.0f;
@@ -1342,31 +1429,35 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
             wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g.vbuf, 0, g.vbufSize);
             for (const SubMesh& sub : mesh.subs) {
                 if (!sub_visible(sub, pl.solo)) continue;
-                WGPUBindGroup bg = make_bg(g.lTri, view_for(sub.texture, g.viewGray), sampler);
+                WGPUBindGroup bg = cached_mesh_bg(sub.texture, (pl.flags & 1u) != 0, false);
                 if (bg == nullptr) continue;
                 wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
                 wgpuRenderPassEncoderDraw(pass, sub.vertexCount, 1, sub.firstVertex, 0);
-                wgpuBindGroupRelease(bg);
             }
             if (textured) {
                 wgpuRenderPassEncoderSetPipeline(pass, g.pTriAlpha);
                 for (const SubMesh& sub : mesh.subs) {
                     if (!sub_visible(sub, pl.solo)) continue;
-                    WGPUBindGroup bg = make_bg(g.lTriAlpha,
-                        view_for(sub.texture, g.viewGray), sampler, g.alphaUbuf);
+                    WGPUBindGroup bg = cached_mesh_bg(sub.texture,
+                        (pl.flags & 1u) != 0, true);
                     if (bg == nullptr) continue;
                     wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
                     wgpuRenderPassEncoderDraw(pass, sub.vertexCount, 1, sub.firstVertex, 0);
-                    wgpuBindGroupRelease(bg);
                 }
             }
         }
         if (wire) {
-            WGPUBindGroup bg = make_bg(g.lWire, nullptr, nullptr);
+            WGPUBindGroup bg = cached_wire_bg(false);
             if (bg != nullptr) {
                 wgpuRenderPassEncoderSetPipeline(pass, g.pWire);
                 draw_wire(pass, bg, pl.solo, g.vbuf, g.vbufSize);
-                wgpuBindGroupRelease(bg);
+            }
+        }
+        if (wire && pl.selectedKey != 0 && scene_view_enabled()) {
+            WGPUBindGroup bg = cached_wire_bg(true);
+            if (bg != nullptr) {
+                wgpuRenderPassEncoderSetPipeline(pass, g.pWire);
+                draw_wire(pass, bg, pl.solo, g.vbuf, g.vbufSize, pl.selectedKey);
             }
         }
     }
@@ -1447,7 +1538,7 @@ void on_present(ModContext*, const GfxPresentContext* c, const void* payload, si
         draw_toolbar(pass, c->target_width, c->target_height, layout, pl.mode, pl.upAxis,
             pl.hoverControl, pl.flyingCamera, pl.solo, pl.uvTex,
             pl.uvTileOffsetX, pl.uvTileOffsetY, pl.textureMenuOpen, pl.texturePage,
-            pl.shapeMenuOpen, pl.shapePage, pl.liveUpdate);
+            pl.shapeMenuOpen, pl.shapePage, pl.liveUpdate, live_control_available());
     }
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
@@ -1636,7 +1727,7 @@ void update_preview_input(ViewState& v) {
         mouseY < toolbar_height(static_cast<float>(clientWidth), v.layout,
             static_cast<uint32_t>(v.mode))) {
         const auto buttons = toolbar_buttons(static_cast<float>(clientWidth), v.layout,
-            static_cast<uint32_t>(v.mode));
+            static_cast<uint32_t>(v.mode), live_control_available());
         for (const ToolbarButton& button : buttons) {
             if (mouseX >= button.x && mouseX < button.x + button.w &&
                 mouseY >= button.y && mouseY < button.y + button.h) {
@@ -1738,7 +1829,7 @@ void update_preview_input(ViewState& v) {
     if (v.flyingCamera && v.layout != PreviewLayout::TwoD) {
         float center[3];
         float radius = 1.0f;
-        mesh_sphere(mesh.get(), center, radius);
+        focused_mesh_sphere(mesh.get(), selected_key(), center, radius);
         float right[3], up[3], axisForward[3];
         axis_basis(static_cast<uint32_t>(std::clamp(v.upAxis, 0, 2)), right, up, axisForward);
         const float yaw = v.yaw * 3.14159265f / 180.0f;
@@ -1844,6 +1935,7 @@ void set_flying_camera(bool enabled) {
 void set_live_update(bool enabled) {
     ViewState& v = view();
     if (enabled && v.layout == PreviewLayout::TwoD) return;
+    if (enabled && !live_control_available()) return;
     v.liveUpdate = enabled;
     g_nextLiveSnapshot = enabled ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point{};
@@ -1904,7 +1996,8 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     ViewState& v = view();
     update_preview_input(v);
     if (v.flyingCamera && !v.flyPositionInitialized) initialize_fly_position(v);
-    if (v.liveUpdate) {
+    if (v.liveUpdate && !live_control_available()) set_live_update(false);
+    if (v.liveUpdate && !scene_view_enabled()) {
         const auto now = std::chrono::steady_clock::now();
         if (g_nextLiveSnapshot.time_since_epoch().count() == 0 || now >= g_nextLiveSnapshot) {
             request_refresh();
@@ -1918,6 +2011,7 @@ void preview_frame(ModContext*, const GfxStageContext*, void*) {
     }
     PresentPayload pl{};
     pl.version = mesh_version();
+    pl.selectedKey = scene_view_enabled() ? selected_key() : 0;
     pl.yaw = v.yaw;
     pl.pitch = static_cast<float>(v.pitch);
     pl.zoom = static_cast<float>(v.zoomPct) / 100.0f;

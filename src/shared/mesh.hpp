@@ -11,8 +11,11 @@ struct ModelInfo {
     uint64_t key = 0;
     uint64_t dataKey = 0;
     float pos[3] = {0, 0, 0};
+    float transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     float radius = 0;
     uint32_t joints = 0, shapes = 0, materials = 0, verts = 0;
+    uint64_t poseKey = 0;
+    bool geometryCacheable = false;
     uint64_t lastFrame = 0;
 };
 
@@ -29,6 +32,7 @@ struct SubMesh {
     int32_t texture = -1;      // index into MeshData::textures, -1 = none
     uint32_t shapeIndex = 0;
     std::string label;         // "mat_name"
+    uint64_t instanceKey = 0;  // nonzero in an aggregated scene mesh
 };
 
 struct MeshData {
@@ -43,6 +47,8 @@ struct MeshData {
     float bmin[3] = {0, 0, 0};
     float bmax[3] = {0, 0, 0};
     uint32_t joints = 0, shapes = 0, materials = 0, vertexCount = 0, triCount = 0;
+    uint64_t poseKey = 0;
+    bool geometryCacheable = false;
     uint64_t version = 0;  // assigned when published
 };
 

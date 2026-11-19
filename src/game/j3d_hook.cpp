@@ -22,20 +22,38 @@ HookAction on_model_entry(ModContext*, void* args, void*, void*) {
     J3DModel* model = mods::arg<J3DModel*>(args, 0);
     if (model == nullptr) return HOOK_CONTINUE;
 
-    const ModelInfo info = parser::describe_j3d_model(model);
+    ModelInfo info = parser::describe_j3d_model(model);
     if (info.key == 0) return HOOK_CONTINUE;
     registry_note(info);
 
-    if (!take_pending(info.key)) return HOOK_CONTINUE;
+    const bool selectedRequest = take_pending(info.key);
+    const bool sceneRequest = take_scene_capture_request(info.key);
+    if (!selectedRequest && !sceneRequest) return HOOK_CONTINUE;
+    info = parser::describe_j3d_model(model, true);
+    registry_note(info);
+
+    if (sceneRequest && info.geometryCacheable) {
+        const std::shared_ptr<const MeshData> cached = scene_model_mesh(info.key);
+        if (cached != nullptr && cached->dataKey == info.dataKey &&
+            cached->geometryCacheable && cached->poseKey == info.poseKey &&
+            update_scene_model_info(info)) {
+            return HOOK_CONTINUE;
+        }
+    }
 
     static uint64_t lastLiveFailureKey = 0;
     auto mesh = std::make_shared<MeshData>();
     mesh->key = info.key;
     mesh->dataKey = info.dataKey;
-    const std::shared_ptr<const MeshData> previous = current_mesh();
+    mesh->poseKey = info.poseKey;
+    mesh->geometryCacheable = info.geometryCacheable;
+    std::shared_ptr<const MeshData> previous = selected_mesh();
+    if (previous == nullptr || previous->key != info.key || previous->dataKey != info.dataKey) {
+        previous = scene_model_mesh(info.key);
+    }
     const bool sameData = previous != nullptr && previous->key == info.key &&
         previous->dataKey == info.dataKey;
-    const bool verbose = !view().liveUpdate || !sameData;
+    const bool verbose = selectedRequest && (!view().liveUpdate || !sameData);
 
     char title[96];
     std::snprintf(title, sizeof(title), "model %06llx (data %06llx)",
@@ -53,7 +71,8 @@ HookAction on_model_entry(ModContext*, void* args, void*, void*) {
                 mesh->triCount, mesh->subs.size(), mesh->textures->size());
         }
         if (lastLiveFailureKey == info.key) lastLiveFailureKey = 0;
-        publish_mesh(std::move(mesh));
+        if (selectedRequest) publish_mesh(mesh);
+        if (sceneRequest) publish_scene_mesh(info, std::move(mesh));
     } else {
         if (verbose || lastLiveFailureKey != info.key) {
             logf(2, "snapshot of %s failed: %s", title, error.c_str());

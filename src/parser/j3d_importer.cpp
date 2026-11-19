@@ -793,7 +793,7 @@ bool snapshot_model(J3DModel* model, MeshData& out, std::string& err,
 
 }  // namespace
 
-ModelInfo describe_j3d_model(::J3DModel* model) {
+ModelInfo describe_j3d_model(::J3DModel* model, bool includePoseSignature) {
     ModelInfo info{};
     if (model == nullptr) return info;
     J3DModelData* md = model->getModelData();
@@ -804,11 +804,68 @@ ModelInfo describe_j3d_model(::J3DModel* model) {
     info.pos[0] = base[0][3];
     info.pos[1] = base[1][3];
     info.pos[2] = base[2][3];
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            info.transform[row * 4 + column] = base[row][column];
+        }
+    }
     info.radius = model_radius(md);
     info.joints = md->getJointNum();
     info.shapes = md->getShapeNum();
     info.materials = md->getMaterialNum();
     info.verts = md->getVtxNum();
+
+    J3DVertexBuffer* vertexBuffer = model->getVertexBuffer();
+    const void* sourcePositions = md->getVtxPosArray();
+    const bool cpuSkinPos = model->checkFlag(J3DMdlFlag_SkinPosCpu);
+    M34 baseInverse{};
+    if (includePoseSignature && sourcePositions != nullptr && vertexBuffer != nullptr &&
+        vertexBuffer->getCurrentVtxPos() == sourcePositions && !cpuSkinPos &&
+        model->getSkinDeform() == nullptr &&
+        inverse_affine(model->getBaseTRMtx(), baseInverse)) {
+        uint64_t poseKey = 14695981039346656037ull;
+        const auto hashValue = [&poseKey](uint32_t value) {
+            poseKey ^= value;
+            poseKey *= 1099511628211ull;
+        };
+        hashValue(static_cast<uint32_t>(md->getDrawMtxNum()));
+        bool validPose = md->getDrawMtxNum() <= 1024;
+        for (uint16_t draw = 0; validPose && draw < md->getDrawMtxNum(); ++draw) {
+            const uint16_t index = md->getDrawMtxIndex(draw);
+            const uint8_t flag = md->getDrawMtxFlag(draw);
+            if (index >= 1024) {
+                validPose = false;
+                break;
+            }
+            M34 worldMatrix{};
+            if (flag == 0) copy_mtx(model->getAnmMtx(index), worldMatrix);
+            else copy_mtx(model->getWeightAnmMtx(index), worldMatrix);
+            if (!worldMatrix.valid) {
+                validPose = false;
+                break;
+            }
+            const M34 localMatrix = multiply_affine(baseInverse, worldMatrix);
+            hashValue(index);
+            hashValue(flag);
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 4; ++column) {
+                    const float component = localMatrix.m[row][column];
+                    if (!std::isfinite(component)) {
+                        validPose = false;
+                        break;
+                    }
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &component, sizeof(bits));
+                    hashValue(bits);
+                }
+                if (!validPose) break;
+            }
+        }
+        if (validPose) {
+            info.poseKey = poseKey;
+            info.geometryCacheable = true;
+        }
+    }
     return info;
 }
 

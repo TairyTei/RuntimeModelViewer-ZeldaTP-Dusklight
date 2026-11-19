@@ -117,7 +117,12 @@ void refresh_scene_list() {
     svc_ui->list_set_items(mod_ctx, g_sceneList, items.data(), items.size());
     if (g_sceneInfo != 0) {
         char buf[160];
-        std::snprintf(buf, sizeof(buf), "%zu models drawn recently, nearest first.<br/>Press a row to open it in the preview window.", models.size());
+        std::snprintf(buf, sizeof(buf),
+            "%zu models drawn recently, nearest first.<br/>%s<br/>"
+            "Press a row to inspect one model.",
+            models.size(), scene_view_enabled()
+                ? "The scene snapshot updates at up to 30 Hz while Play is active; selection focuses the model."
+                : "Use the button above to preview the scene.");
         svc_ui->elem_set_rml(mod_ctx, g_sceneInfo, buf);
     }
 }
@@ -134,11 +139,24 @@ void on_pick(ModContext*, void* ud) {
     }
 }
 void on_refresh_scene(ModContext*, void*) { refresh_scene_list(); }
+void on_toggle_scene_view(ModContext*, void*) {
+    const bool enabled = !scene_view_enabled();
+    set_scene_view_enabled(enabled);
+    view().solo = -1;
+    view().liveUpdate = false;
+    set_flying_camera(false);
+    if (enabled) set_preview_layout(PreviewLayout::ThreeD);
+    if (preview_open() != MOD_OK) {
+        toast("Could not open the preview window.");
+    }
+    refresh_scene_list();
+}
 
 ModResult build_scene_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
     g_sceneList = 0;
     g_sceneInfo = 0;
-    svc_ui->pane_add_section(mod_ctx, left, "Models in view");
+
+    add_button(left, "All-model preview", on_toggle_scene_view);
     add_button(left, "Refresh list", on_refresh_scene);
     const auto& sels = selectors();
     g_pickLabels.clear();
@@ -147,6 +165,8 @@ ModResult build_scene_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiE
         g_pickLabels.push_back(std::string("Pick: ") + sels[i].label);
         add_button(left, g_pickLabels.back().c_str(), on_pick, reinterpret_cast<void*>(i));
     }
+    svc_ui->pane_add_section(mod_ctx, left, "Models in view");
+
     UiListDesc ld = UI_LIST_DESC_INIT;
     ld.on_pressed = on_scene_row;
     ld.is_selected = scene_row_selected;
@@ -387,7 +407,7 @@ ModResult build_view_tab(ModContext*, UiWindowHandle, UiElementHandle left, UiEl
         "Flying camera and live-pose controls are shown only in 3D; the UV pane has its own pan, zoom, and texture picker. "
         "The SHAPES picker in the 3D toolbar isolates a shape and selects its texture; ALL SHAPES clears the isolation. "
         "The U-/U+/V-/V+ preview buttons shift the UV unwrap by one tile relative to the selected texture. "
-        "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance. "
+        "The play/pause button refreshes the selected pose at up to 30 Hz and may affect game performance; it is hidden for cacheable models without joints. "
         "F focuses the model. In orbit mode, Alt + left-drag rotates and right-drag zooms. "
         "In flying mode, WASD moves, Q/E moves vertically, mouse-drag looks around, and the Fly speed setting controls movement speed; Shift gives a temporary 4x boost. "
         "Auto-rotate stops when you adjust the camera.", nullptr);

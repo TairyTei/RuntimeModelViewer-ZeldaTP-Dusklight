@@ -22,14 +22,14 @@ inline Mat4 mat_mul(const Mat4& a, const Mat4& b) {
     return o;
 }
 
-inline Mat4 mat_perspective(float fovyRad, float aspect, float zn, float zf) {
+inline Mat4 mat_perspective_reversed_z(float fovyRad, float aspect, float zn, float zf) {
     const float f = 1.0f / std::tan(fovyRad * 0.5f);
     Mat4 o{};
     o.m[0] = f / aspect;
     o.m[5] = f;
-    o.m[10] = zf / (zn - zf);
+    o.m[10] = zn / (zf - zn);
     o.m[11] = -1.0f;
-    o.m[14] = zn * zf / (zn - zf);
+    o.m[14] = zn * zf / (zf - zn);
     return o;
 }
 

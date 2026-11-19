@@ -70,13 +70,21 @@ std::vector<ModelInfo> registry_snapshot();  // sorted nearest-first, stale entr
 // ---- selection ----
 void select_model(uint64_t key);   // select only
 uint64_t selected_key();
+void set_scene_view_enabled(bool enabled);
+bool scene_view_enabled();
 void request_refresh();            // re-snapshot the selected model (current pose)
 bool take_pending(uint64_t key);   // hook side: true once when `key` should be snapshotted
+bool take_scene_capture_request(uint64_t key);
+void publish_scene_mesh(const ModelInfo& info, std::shared_ptr<MeshData> mesh);
+bool update_scene_model_info(const ModelInfo& info);
+std::shared_ptr<const MeshData> scene_model_mesh(uint64_t key);
 
 // ---- mesh snapshot ----
 void publish_mesh(std::shared_ptr<MeshData> mesh);
+std::shared_ptr<const MeshData> selected_mesh();
 std::shared_ptr<const MeshData> current_mesh();
 uint64_t mesh_version();
+bool scene_focus_sphere(uint64_t key, float center[3], float& radius);
 
 // ---- view / camera ----
 ViewState& view();
